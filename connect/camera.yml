@@ -1,0 +1,12 @@
+version: 1
+
+device_id: 0
+name: ""
+
+source:
+  uri: ""
+  username: ""
+  password: ""
+
+destination:
+  gcs_uri: ""
