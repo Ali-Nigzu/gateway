@@ -8,10 +8,10 @@ import (
 	"image"
 	"image/jpeg"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -30,6 +30,7 @@ const (
 	rawFrameSize     = frameWidth * frameHeight * rgbBytesPerPixel
 	jpegQuality      = 90
 	ffmpegErrorLimit = 32 * 1024
+	objectTimeLayout = "2006-01-02T15-04-05.000000Z.jpg"
 )
 
 // CameraConfig identifies one RTSP source and its GCS destination.
@@ -38,6 +39,7 @@ type CameraConfig struct {
 	DeviceID    int64             `yaml:"device_id"`
 	Name        string            `yaml:"name"`
 	Source      SourceConfig      `yaml:"source"`
+	Capture     CaptureConfig     `yaml:"capture"`
 	Destination DestinationConfig `yaml:"destination"`
 }
 
@@ -46,6 +48,12 @@ type SourceConfig struct {
 	URI      string `yaml:"uri"`
 	Username string `yaml:"username"`
 	Password string `yaml:"password"`
+}
+
+// CaptureConfig controls the fixed candidate rate and scene-change threshold.
+type CaptureConfig struct {
+	FPS                    int     `yaml:"fps"`
+	ChangeThresholdPercent float64 `yaml:"change_threshold_percent"`
 }
 
 // DestinationConfig contains the GCS bucket and optional object prefix.
@@ -76,7 +84,8 @@ func LoadConfig(filename string) (CameraConfig, error) {
 	return config, nil
 }
 
-// Connect captures one current RTSP frame and uploads one 1280x720 JPEG to GCS.
+// Connect streams normalized RTSP frames, suppresses unchanged candidates, and
+// uploads changed 1280x720 JPEGs until cancellation or a fatal error.
 func Connect(ctx context.Context, config CameraConfig) error {
 	if err := validateConfig(config); err != nil {
 		return err
@@ -91,33 +100,51 @@ func Connect(ctx context.Context, config CameraConfig) error {
 		return err
 	}
 
-	rgb, err := captureRGBFrame(ctx, config.Source)
-	if err != nil {
-		return err
-	}
-	fmt.Println("RTSP connected")
-
-	jpegData, err := encodeRGBFrame(rgb)
-	if err != nil {
-		return err
-	}
-	fmt.Println("Frame captured")
-
 	destination, err := parseGCSURI(config.Destination.GCSURI)
 	if err != nil {
 		return errors.New("camera config invalid: destination.gcs_uri must be a gs URI with a bucket")
 	}
-	if err := uploadJPEG(ctx, destination, credentialPath, jpegData); err != nil {
+	uploader, err := newGCSUploader(ctx, destination, credentialPath)
+	if err != nil {
 		return err
 	}
-	fmt.Println("Frame uploaded")
+	defer uploader.close()
 
-	return nil
+	processor := newStreamProcessor(
+		config.Capture.ChangeThresholdPercent,
+		encodeRGBFrame,
+		uploader.upload,
+	)
+	connected := false
+	streamErr := streamRTSP(ctx, config.Source, config.Capture.FPS, time.Now, func(candidate frameCandidate) error {
+		if !connected {
+			fmt.Println("RTSP connected")
+			connected = true
+		}
+
+		uploaded, err := processor.process(ctx, candidate)
+		if err != nil {
+			return err
+		}
+		if uploaded {
+			fmt.Println("Frame uploaded")
+		}
+		return nil
+	})
+
+	if ctx.Err() != nil && processor.successfulUploads > 0 {
+		fmt.Println("Stopped")
+		return nil
+	}
+	if ctx.Err() != nil {
+		return errors.New("stream stopped before first successful upload: operation cancelled")
+	}
+	return streamErr
 }
 
 func validateConfig(config CameraConfig) error {
-	if config.Version != 1 {
-		return errors.New("camera config invalid: version must be 1")
+	if config.Version != 2 {
+		return errors.New("camera config invalid: version must be 2")
 	}
 	if config.DeviceID <= 0 {
 		return errors.New("camera config invalid: device_id must be greater than 0")
@@ -133,6 +160,14 @@ func validateConfig(config CameraConfig) error {
 	parsedRTSP, err := url.Parse(rtspURI)
 	if err != nil || !strings.EqualFold(parsedRTSP.Scheme, "rtsp") || parsedRTSP.Hostname() == "" {
 		return errors.New("camera config invalid: source.uri must be an rtsp URI with a host")
+	}
+
+	if config.Capture.FPS != 3 {
+		return errors.New("camera config invalid: capture.fps must be 3")
+	}
+	threshold := config.Capture.ChangeThresholdPercent
+	if math.IsNaN(threshold) || math.IsInf(threshold, 0) || threshold <= 0 || threshold > 100 {
+		return errors.New("camera config invalid: capture.change_threshold_percent must be greater than 0 and at most 100")
 	}
 
 	if strings.TrimSpace(config.Destination.GCSURI) == "" {
@@ -188,86 +223,6 @@ func authenticatedRTSPURI(source SourceConfig) (string, error) {
 	return parsed.String(), nil
 }
 
-func ffmpegArguments(sourceURI string) []string {
-	return []string{
-		"-hide_banner",
-		"-loglevel", "error",
-		"-rtsp_transport", "tcp",
-		"-i", sourceURI,
-		"-map", "0:v:0",
-		"-an",
-		"-sn",
-		"-dn",
-		"-frames:v", "1",
-		"-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,format=rgb24",
-		"-f", "rawvideo",
-		"-pix_fmt", "rgb24",
-		"pipe:1",
-	}
-}
-
-func captureRGBFrame(ctx context.Context, source SourceConfig) ([]byte, error) {
-	ffmpegPath, err := exec.LookPath("ffmpeg")
-	if err != nil {
-		return nil, errors.New("frame capture/decode failed: ffmpeg not found on PATH")
-	}
-
-	sourceURI, err := authenticatedRTSPURI(source)
-	if err != nil {
-		return nil, err
-	}
-
-	cmd := exec.CommandContext(ctx, ffmpegPath, ffmpegArguments(sourceURI)...)
-	var stdout bytes.Buffer
-	stderr := newCappedBuffer(ffmpegErrorLimit)
-	cmd.Stdout = &stdout
-	cmd.Stderr = stderr
-
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return nil, errors.New("RTSP connection failed: operation cancelled or timed out")
-		}
-		return nil, classifyFFmpegFailure(stderr.String())
-	}
-	if stdout.Len() != rawFrameSize {
-		return nil, fmt.Errorf("frame capture/decode failed: expected %d RGB24 bytes, received %d", rawFrameSize, stdout.Len())
-	}
-
-	return stdout.Bytes(), nil
-}
-
-func classifyFFmpegFailure(diagnostic string) error {
-	lower := strings.ToLower(diagnostic)
-	authenticationMarkers := []string{
-		"401 unauthorized",
-		"401 (unauthorized)",
-		"authentication failed",
-		"server returned 401",
-		"method describe failed: 401",
-	}
-	for _, marker := range authenticationMarkers {
-		if strings.Contains(lower, marker) {
-			return errors.New("RTSP authentication failed")
-		}
-	}
-
-	connectionMarkers := []string{
-		"connection refused",
-		"connection timed out",
-		"could not connect",
-		"network is unreachable",
-		"no route to host",
-		"unable to open resource",
-	}
-	for _, marker := range connectionMarkers {
-		if strings.Contains(lower, marker) {
-			return errors.New("RTSP connection failed")
-		}
-	}
-
-	return errors.New("frame capture/decode failed")
-}
-
 func encodeRGBFrame(rgb []byte) ([]byte, error) {
 	if len(rgb) != rawFrameSize {
 		return nil, fmt.Errorf("frame capture/decode failed: expected %d RGB24 bytes, received %d", rawFrameSize, len(rgb))
@@ -306,25 +261,32 @@ func parseGCSURI(rawURI string) (gcsDestination, error) {
 }
 
 func objectName(prefix string, timestamp time.Time) string {
-	filename := "connect-test-" + timestamp.UTC().Format("20060102T150405.000000000Z") + ".jpg"
+	filename := timestamp.UTC().Format(objectTimeLayout)
 	if prefix == "" {
 		return filename
 	}
 	return prefix + "/" + filename
 }
 
-func uploadJPEG(ctx context.Context, destination gcsDestination, credentialPath string, jpegData []byte) error {
+type gcsUploader struct {
+	client      *storage.Client
+	destination gcsDestination
+}
+
+func newGCSUploader(ctx context.Context, destination gcsDestination, credentialPath string) (*gcsUploader, error) {
 	client, err := storage.NewClient(ctx, option.WithCredentialsFile(credentialPath))
 	if err != nil {
-		return errors.New("GCS authentication failed")
+		return nil, errors.New("GCS authentication failed")
 	}
-	defer client.Close()
+	return &gcsUploader{client: client, destination: destination}, nil
+}
 
+func (uploader *gcsUploader) upload(ctx context.Context, jpegData []byte, observedAt time.Time) error {
 	uploadContext, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	object := client.Bucket(destination.bucket).
-		Object(objectName(destination.prefix, time.Now())).
+	object := uploader.client.Bucket(uploader.destination.bucket).
+		Object(objectName(uploader.destination.prefix, observedAt)).
 		Retryer(storage.WithPolicy(storage.RetryNever)).
 		If(storage.Conditions{DoesNotExist: true})
 	writer := object.NewWriter(uploadContext)
@@ -332,10 +294,12 @@ func uploadJPEG(ctx context.Context, destination gcsDestination, credentialPath 
 
 	written, err := writer.Write(jpegData)
 	if err != nil {
+		_ = writer.CloseWithError(err)
 		cancel()
 		return classifyGCSFailure(err)
 	}
 	if written != len(jpegData) {
+		_ = writer.CloseWithError(io.ErrShortWrite)
 		cancel()
 		return classifyGCSFailure(io.ErrShortWrite)
 	}
@@ -344,6 +308,10 @@ func uploadJPEG(ctx context.Context, destination gcsDestination, credentialPath 
 	}
 
 	return nil
+}
+
+func (uploader *gcsUploader) close() {
+	_ = uploader.client.Close()
 }
 
 func classifyGCSFailure(err error) error {

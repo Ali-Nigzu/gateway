@@ -1,12 +1,16 @@
-version: 1
+version: 2
 
-device_id: 0
-name: ""
+device_id: 1
+name: "Laptop Webcam"
 
 source:
-  uri: ""
+  uri: "rtsp://127.0.0.1:8554/cam"
   username: ""
   password: ""
 
+capture:
+  fps: 3
+  change_threshold_percent: 0.5
+
 destination:
-  gcs_uri: ""
+  gcs_uri: "gs://camostesting/Orgs/Sites/Devices/TestCamera"
