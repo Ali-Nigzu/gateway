@@ -1,83 +1,64 @@
-package connect
+package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
+	"google.golang.org/api/option"
 )
 
-const (
-	serviceAccountFilename       = "sa.json"
-	frameSeenPersistenceInterval = time.Minute
-	shutdownOperationTimeout     = 5 * time.Second
-)
+const serviceAccountFilename = "sa.json"
 
-type deviceFailure struct {
-	stage string
-}
+func commission(ctx context.Context, siteID int64) (returnErr error) {
+	credentialsJSON, err := os.ReadFile(serviceAccountFilename)
+	if err != nil {
+		return errors.New("sa.json unavailable")
+	}
 
-func (deviceFailure) Error() string {
-	return "camera failed"
-}
-
-// Commission loads the requested Site from Postgres and runs one independent
-// camera worker for every enabled Device until cancellation or until all
-// workers terminate.
-func Commission(ctx context.Context, siteID int64) (returnErr error) {
-	store, err := newPostgresStore(ctx, serviceAccountFilename)
+	store, err := newPostgresStore(ctx, credentialsJSON)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if err := store.Close(); err != nil {
+		if err := store.close(); err != nil {
 			fmt.Fprintln(os.Stderr, "WARN: gateway shutdown failed")
-			returnErr = errors.Join(returnErr, errors.New("gateway shutdown failed"))
+			if returnErr == nil {
+				returnErr = err
+			}
 		}
 	}()
 
-	site, devices, err := store.LoadSite(ctx, siteID)
-	if err != nil || site.status != "enabled" {
-		return errors.New("site load failed")
+	devices, err := store.loadDevices(ctx, siteID)
+	if err != nil {
+		return err
 	}
-
-	activeDevices := make([]deviceRecord, 0, len(devices))
-	for _, device := range devices {
-		if device.status == "enabled" {
-			activeDevices = append(activeDevices, device)
-		}
-	}
-	if len(activeDevices) == 0 {
+	if len(devices) == 0 {
 		return errors.New("no active devices")
 	}
 
-	gcsClient, err := newStorageClient(ctx, serviceAccountFilename)
+	gcsClient, err := storage.NewClient(ctx, option.WithCredentialsJSON(credentialsJSON))
 	if err != nil {
-		return err
+		return errors.New("gateway startup failed")
 	}
+	credentialsJSON = nil
 	defer func() {
 		if err := gcsClient.Close(); err != nil {
 			fmt.Fprintln(os.Stderr, "WARN: gateway shutdown failed")
-			returnErr = errors.Join(returnErr, errors.New("gateway shutdown failed"))
+			if returnErr == nil {
+				returnErr = errors.New("gateway shutdown failed")
+			}
 		}
 	}()
 
-	recordEvent(ctx, store, gatewayEvent{
-		siteID: site.id, occurredAt: time.Now().UTC(),
-		eventType: eventGatewayStarted, message: "Gateway started",
-	})
-	fmt.Printf("Gateway started [site_id=%d devices=%d]\n", site.id, len(activeDevices))
-
-	runErr := runSiteSupervisor(ctx, site.id, activeDevices, store, gcsClient)
+	recordEvent(ctx, store, siteID, 0, eventGatewayStarted, "")
+	runErr := runSiteSupervisor(ctx, siteID, devices, store, gcsClient)
 	if ctx.Err() != nil && runErr == nil {
-		recordEvent(ctx, store, gatewayEvent{
-			siteID: site.id, occurredAt: time.Now().UTC(),
-			eventType: eventGatewayStopped, message: "Gateway stopped",
-		})
+		recordEvent(context.Background(), store, siteID, 0, eventGatewayStopped, "")
 		return nil
 	}
 	return runErr
@@ -90,207 +71,130 @@ func runSiteSupervisor(
 	store *postgresStore,
 	gcsClient *storage.Client,
 ) error {
-	results := make(chan struct{}, len(devices))
-	for _, device := range devices {
-		device := device
+	var workers sync.WaitGroup
+	workers.Add(len(devices))
+	for index := range devices {
+		device := devices[index]
+		devices[index] = deviceRecord{}
 		go func() {
-			runDeviceWorker(ctx, siteID, device, store, gcsClient)
-			results <- struct{}{}
+			defer workers.Done()
+			runDevice(ctx, siteID, device, store, gcsClient)
 		}()
 	}
-
-	for range devices {
-		<-results
-	}
+	workers.Wait()
 	if ctx.Err() != nil {
 		return nil
 	}
 	return errors.New("all device workers stopped")
 }
 
-func runDeviceWorker(
+func runDevice(
 	ctx context.Context,
 	siteID int64,
 	device deviceRecord,
 	store *postgresStore,
 	gcsClient *storage.Client,
 ) {
+	deviceID := device.id
 	defer func() {
 		if recover() != nil {
-			recordDeviceFailure(ctx, store, siteID, device.id, failureStageCrash)
+			recordDeviceFailure(ctx, store, siteID, deviceID, failureStageCrash)
 		}
 	}()
 
-	recordEvent(ctx, store, gatewayEvent{
-		siteID: siteID, deviceID: &device.id, occurredAt: time.Now().UTC(),
-		eventType: eventDeviceStarted, message: "Device started",
-	})
-
-	config, err := cameraConfigFromDevice(device)
-	if err != nil {
-		recordDeviceFailure(ctx, store, siteID, device.id, failureStageStream)
-		return
+	recordEvent(ctx, store, siteID, deviceID, eventDeviceStarted, "")
+	runtime := deviceRuntime{siteID: siteID, deviceID: deviceID, store: store}
+	sourceURI, fps, runErr := runtime.prepare(device, gcsClient)
+	device = deviceRecord{}
+	if runErr == nil {
+		runErr = runtime.run(ctx, sourceURI, fps)
 	}
 
-	observer := &deviceObserver{siteID: siteID, deviceID: device.id, store: store}
-	runErr := connectCamera(ctx, config, gcsClient, observer)
-
-	flushContext := ctx
-	flushCancel := func() {}
+	shutdownContext := ctx
 	if ctx.Err() != nil {
-		flushContext, flushCancel = context.WithTimeout(context.Background(), shutdownOperationTimeout)
+		shutdownContext = context.Background()
 	}
-	flushErr := observer.flush(flushContext)
-	flushCancel()
+	flushErr := runtime.flush(shutdownContext)
 
 	if ctx.Err() != nil {
 		if flushErr != nil {
-			recordDeviceFailure(ctx, store, siteID, device.id, failureStageDatabase)
+			recordDeviceFailure(shutdownContext, store, siteID, deviceID, failureStageDatabase)
 			return
 		}
-		recordEvent(ctx, store, gatewayEvent{
-			siteID: siteID, deviceID: &device.id, occurredAt: time.Now().UTC(),
-			eventType: eventDeviceStopped, message: "Device stopped",
-		})
+		recordEvent(shutdownContext, store, siteID, deviceID, eventDeviceStopped, "")
 		return
 	}
-
 	if flushErr != nil {
-		recordDeviceFailure(ctx, store, siteID, device.id, failureStageDatabase)
+		recordDeviceFailure(ctx, store, siteID, deviceID, failureStageDatabase)
 		return
 	}
 
-	stage := failureStageStream
-	var failure deviceFailure
-	if errors.As(runErr, &failure) {
-		stage = failure.stage
+	failure, ok := runErr.(deviceFailure)
+	if !ok {
+		failure = failureStageStream
 	}
-	recordDeviceFailure(ctx, store, siteID, device.id, stage)
+	recordDeviceFailure(ctx, store, siteID, deviceID, failure)
 }
 
-func recordDeviceFailure(ctx context.Context, store *postgresStore, siteID, deviceID int64, stage string) {
-	recordEvent(ctx, store, gatewayEvent{
-		siteID: siteID, deviceID: &deviceID, occurredAt: time.Now().UTC(),
-		eventType: eventDeviceFailed, message: "Device failed", stage: stage,
-	})
+func recordDeviceFailure(
+	ctx context.Context,
+	store *postgresStore,
+	siteID, deviceID int64,
+	stage deviceFailure,
+) {
+	recordEvent(ctx, store, siteID, deviceID, eventDeviceFailed, stage)
 	fmt.Fprintf(os.Stderr, "WARN: camera failed [device_id=%d]\n", deviceID)
 }
 
-func recordEvent(ctx context.Context, store *postgresStore, event gatewayEvent) {
-	eventContext := ctx
-	cancel := func() {}
+func recordEvent(
+	ctx context.Context,
+	store *postgresStore,
+	siteID, deviceID int64,
+	eventType string,
+	stage deviceFailure,
+) {
 	if ctx.Err() != nil {
-		eventContext, cancel = context.WithTimeout(context.Background(), shutdownOperationTimeout)
+		ctx = context.Background()
 	}
-	defer cancel()
 
-	if err := store.RecordEvent(eventContext, event); err != nil {
-		if event.deviceID == nil {
-			fmt.Fprintf(os.Stderr, "WARN: gateway log write failed [site_id=%d event=%s]\n", event.siteID, event.eventType)
-			return
-		}
-		fmt.Fprintf(
-			os.Stderr,
-			"WARN: gateway log write failed [site_id=%d device_id=%d event=%s]\n",
-			event.siteID,
-			*event.deviceID,
-			event.eventType,
-		)
+	details := `{}`
+	if stage != "" {
+		details = `{"stage":"` + string(stage) + `"}`
 	}
-}
-
-type deviceObserver struct {
-	siteID              int64
-	deviceID            int64
-	store               *postgresStore
-	latestObservedAt    time.Time
-	lastPersistedSeenAt time.Time
-}
-
-func (observer *deviceObserver) connected(ctx context.Context, at time.Time) error {
-	at = at.UTC()
-	observer.observe(at)
-	if err := observer.store.MarkConnected(ctx, observer.siteID, observer.deviceID, at); err != nil {
-		return deviceFailure{stage: failureStageDatabase}
+	var databaseDeviceID any
+	if deviceID != 0 {
+		databaseDeviceID = deviceID
 	}
-	observer.lastPersistedSeenAt = laterTime(observer.lastPersistedSeenAt, at)
-	return nil
-}
 
-func (observer *deviceObserver) frameObserved(ctx context.Context, at time.Time) error {
-	observer.observe(at.UTC())
-	if observer.lastPersistedSeenAt.IsZero() ||
-		observer.latestObservedAt.Sub(observer.lastPersistedSeenAt) >= frameSeenPersistenceInterval {
-		return observer.persistLatestSeen(ctx)
-	}
-	return nil
-}
-
-func (observer *deviceObserver) uploaded(ctx context.Context, capturedAt, completedAt time.Time) error {
-	capturedAt = capturedAt.UTC()
-	completedAt = completedAt.UTC()
-	observer.observe(capturedAt)
-	if err := observer.store.MarkUploaded(
+	_, err := store.database.ExecContext(
 		ctx,
-		observer.siteID,
-		observer.deviceID,
-		capturedAt,
-		completedAt,
-	); err != nil {
-		return deviceFailure{stage: failureStageDatabase}
+		`INSERT INTO public.gateway_logs (
+    site_id,
+    device_id,
+    occurred_at,
+    event_type,
+    message,
+    details
+)
+VALUES ($1, $2, $3, $4, $4, $5::jsonb)`,
+		siteID,
+		databaseDeviceID,
+		time.Now().UTC(),
+		eventType,
+		details,
+	)
+	if err == nil {
+		return
 	}
-	observer.lastPersistedSeenAt = laterTime(observer.lastPersistedSeenAt, capturedAt)
-	return nil
-}
-
-func (observer *deviceObserver) flush(ctx context.Context) error {
-	if observer.latestObservedAt.IsZero() ||
-		!observer.latestObservedAt.After(observer.lastPersistedSeenAt) {
-		return nil
+	if deviceID == 0 {
+		fmt.Fprintf(os.Stderr, "WARN: gateway log write failed [site_id=%d event=%s]\n", siteID, eventType)
+		return
 	}
-	return observer.persistLatestSeen(ctx)
-}
-
-func (observer *deviceObserver) observe(at time.Time) {
-	if at.After(observer.latestObservedAt) {
-		observer.latestObservedAt = at
-	}
-}
-
-func (observer *deviceObserver) persistLatestSeen(ctx context.Context) error {
-	if err := observer.store.AdvanceFrameSeen(
-		ctx,
-		observer.siteID,
-		observer.deviceID,
-		observer.latestObservedAt,
-	); err != nil {
-		return deviceFailure{stage: failureStageDatabase}
-	}
-	observer.lastPersistedSeenAt = observer.latestObservedAt
-	return nil
-}
-
-func cameraConfigFromDevice(device deviceRecord) (cameraConfig, error) {
-	var source sourceConfig
-	if err := json.Unmarshal(device.rtspConfig, &source); err != nil {
-		return cameraConfig{}, deviceFailure{stage: failureStageStream}
-	}
-
-	var capture captureConfig
-	if err := json.Unmarshal(device.captureConfig, &capture); err != nil {
-		return cameraConfig{}, deviceFailure{stage: failureStageStream}
-	}
-
-	return cameraConfig{
-		source:  source,
-		capture: capture,
-		gcsURI:  device.gcsURI,
-	}, nil
-}
-
-func laterTime(left, right time.Time) time.Time {
-	if right.After(left) {
-		return right
-	}
-	return left
+	fmt.Fprintf(
+		os.Stderr,
+		"WARN: gateway log write failed [site_id=%d device_id=%d event=%s]\n",
+		siteID,
+		deviceID,
+		eventType,
+	)
 }

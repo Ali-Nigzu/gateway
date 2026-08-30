@@ -1,9 +1,9 @@
-package connect
+package main
 
 import (
 	"bytes"
 	"context"
-	"errors"
+	"encoding/json"
 	"image"
 	"image/jpeg"
 	"io"
@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
-	"google.golang.org/api/option"
 )
 
 const (
@@ -24,90 +23,111 @@ const (
 	objectTimeLayout = "2006-01-02T15-04-05.000000Z.jpg"
 )
 
-type cameraConfig struct {
-	source  sourceConfig
-	capture captureConfig
-	gcsURI  string
+type deviceRuntime struct {
+	siteID              int64
+	deviceID            int64
+	store               *postgresStore
+	bucket              *storage.BucketHandle
+	prefix              string
+	threshold           float64
+	comparisons         [2][comparisonCellCount]byte
+	currentComparison   *[comparisonCellCount]byte
+	baselineComparison  *[comparisonCellCount]byte
+	hasBaseline         bool
+	latestObservedAt    time.Time
+	lastPersistedSeenAt time.Time
 }
 
-type sourceConfig struct {
-	URI      string `json:"uri"`
-	Username string `json:"username"`
-	Password string `json:"password"`
+func (runtime *deviceRuntime) prepare(
+	device deviceRecord,
+	gcsClient *storage.Client,
+) (string, int, error) {
+	var source struct {
+		URI      string `json:"uri"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.Unmarshal(device.rtspConfig, &source); err != nil {
+		return "", 0, failureStageStream
+	}
+	var capture struct {
+		FPS       int     `json:"fps"`
+		Threshold float64 `json:"change_threshold_percent"`
+	}
+	if err := json.Unmarshal(device.captureConfig, &capture); err != nil {
+		return "", 0, failureStageStream
+	}
+
+	sourceURL, err := url.Parse(strings.TrimSpace(source.URI))
+	if err != nil {
+		return "", 0, failureStageStream
+	}
+	if source.Username != "" || source.Password != "" {
+		if source.Password == "" {
+			sourceURL.User = url.User(source.Username)
+		} else {
+			sourceURL.User = url.UserPassword(source.Username, source.Password)
+		}
+	}
+	destination, err := url.Parse(strings.TrimSpace(device.gcsURI))
+	if err != nil {
+		return "", 0, failureStageStream
+	}
+
+	runtime.bucket = gcsClient.Bucket(destination.Host)
+	runtime.prefix = strings.Trim(destination.Path, "/")
+	runtime.threshold = capture.Threshold
+	runtime.currentComparison = &runtime.comparisons[0]
+	runtime.baselineComparison = &runtime.comparisons[1]
+	return sourceURL.String(), capture.FPS, nil
 }
 
-type captureConfig struct {
-	FPS                    int     `json:"fps"`
-	ChangeThresholdPercent float64 `json:"change_threshold_percent"`
+func (runtime *deviceRuntime) run(ctx context.Context, sourceURI string, fps int) error {
+	connected := false
+	return streamRTSP(ctx, sourceURI, fps, func(rgb []byte, observedAt time.Time) error {
+		// The first complete normalized frame is the earliest reliable
+		// connection evidence exposed by the FFmpeg pipeline.
+		if !connected {
+			if err := runtime.connected(ctx, observedAt); err != nil {
+				return err
+			}
+			connected = true
+		}
+		if err := runtime.frameObserved(ctx, observedAt); err != nil {
+			return err
+		}
+		return runtime.process(ctx, rgb, observedAt)
+	})
 }
 
-type gcsDestination struct {
-	bucket string
-	prefix string
-}
+func (runtime *deviceRuntime) process(ctx context.Context, rgb []byte, observedAt time.Time) error {
+	fillComparison(rgb, runtime.currentComparison)
+	if runtime.hasBaseline && !materiallyChanged(
+		runtime.baselineComparison,
+		runtime.currentComparison,
+		runtime.threshold,
+	) {
+		return nil
+	}
 
-func connectCamera(
-	ctx context.Context,
-	config cameraConfig,
-	client *storage.Client,
-	observer *deviceObserver,
-) error {
-	destination, err := parseGCSURI(config.gcsURI)
+	jpegData, err := encodeRGBFrame(rgb)
 	if err != nil {
 		return err
 	}
-	uploader := &gcsUploader{client: client, destination: destination}
-	processor := newStreamProcessor(
-		config.capture.ChangeThresholdPercent,
-		uploader,
-		observer,
-	)
-
-	connected := false
-	return streamRTSP(
-		ctx,
-		config.source,
-		config.capture.FPS,
-		func(candidate frameCandidate) error {
-			// FFmpeg exposes no reliable RTSP-handshake callback. The first
-			// complete normalized frame is the earliest trustworthy evidence
-			// that the stream is operational.
-			if !connected {
-				if err := observer.connected(ctx, candidate.observedAt); err != nil {
-					return err
-				}
-				connected = true
-			}
-			if err := observer.frameObserved(ctx, candidate.observedAt); err != nil {
-				return err
-			}
-			_, err := processor.process(ctx, candidate)
-			return err
-		},
-	)
-}
-
-func authenticatedRTSPURI(source sourceConfig) (string, error) {
-	parsed, err := url.Parse(strings.TrimSpace(source.URI))
-	if err != nil {
-		return "", deviceFailure{stage: failureStageStream}
+	if err := runtime.upload(ctx, jpegData, observedAt); err != nil {
+		return err
 	}
 
-	if source.Username != "" || source.Password != "" {
-		if source.Password == "" {
-			parsed.User = url.User(source.Username)
-		} else {
-			parsed.User = url.UserPassword(source.Username, source.Password)
-		}
-	}
-	return parsed.String(), nil
+	// Baseline advances after GCS success and remains advanced if the following
+	// database write fails, preventing a duplicate object write.
+	runtime.baselineComparison, runtime.currentComparison =
+		runtime.currentComparison, runtime.baselineComparison
+	runtime.hasBaseline = true
+	completedAt := time.Now().UTC()
+	return runtime.uploaded(ctx, observedAt, completedAt)
 }
 
 func encodeRGBFrame(rgb []byte) ([]byte, error) {
-	if len(rgb) != rawFrameSize {
-		return nil, deviceFailure{stage: failureStageStream}
-	}
-
 	img := image.NewRGBA(image.Rect(0, 0, frameWidth, frameHeight))
 	sourceOffset := 0
 	for y := 0; y < frameHeight; y++ {
@@ -123,67 +143,105 @@ func encodeRGBFrame(rgb []byte) ([]byte, error) {
 
 	var encoded bytes.Buffer
 	if err := jpeg.Encode(&encoded, img, &jpeg.Options{Quality: jpegQuality}); err != nil {
-		return nil, deviceFailure{stage: failureStageStream}
+		return nil, failureStageStream
 	}
 	return encoded.Bytes(), nil
 }
 
-func parseGCSURI(rawURI string) (gcsDestination, error) {
-	parsed, err := url.Parse(strings.TrimSpace(rawURI))
+func (runtime *deviceRuntime) upload(ctx context.Context, jpegData []byte, observedAt time.Time) error {
+	object := runtime.bucket.
+		Object(objectName(runtime.prefix, observedAt)).
+		Retryer(storage.WithPolicy(storage.RetryNever)).
+		If(storage.Conditions{DoesNotExist: true})
+	writer := object.NewWriter(ctx)
+	writer.ContentType = "image/jpeg"
+
+	written, err := writer.Write(jpegData)
 	if err != nil {
-		return gcsDestination{}, deviceFailure{stage: failureStageUpload}
+		_ = writer.CloseWithError(err)
+		return failureStageUpload
 	}
-	return gcsDestination{
-		bucket: parsed.Host,
-		prefix: strings.Trim(parsed.Path, "/"),
-	}, nil
+	if written != len(jpegData) {
+		_ = writer.CloseWithError(io.ErrShortWrite)
+		return failureStageUpload
+	}
+	if err := writer.Close(); err != nil {
+		return failureStageUpload
+	}
+	return nil
 }
 
 func objectName(prefix string, timestamp time.Time) string {
-	filename := timestamp.UTC().Format(objectTimeLayout)
+	filename := timestamp.Format(objectTimeLayout)
 	if prefix == "" {
 		return filename
 	}
 	return prefix + "/" + filename
 }
 
-type gcsUploader struct {
-	client      *storage.Client
-	destination gcsDestination
+func (runtime *deviceRuntime) connected(ctx context.Context, at time.Time) error {
+	runtime.observe(at)
+	if err := runtime.store.markConnected(ctx, runtime.siteID, runtime.deviceID, at); err != nil {
+		return failureStageDatabase
+	}
+	runtime.lastPersistedSeenAt = laterTime(runtime.lastPersistedSeenAt, at)
+	return nil
 }
 
-func newStorageClient(ctx context.Context, credentialPath string) (*storage.Client, error) {
-	client, err := storage.NewClient(ctx, option.WithCredentialsFile(credentialPath))
-	if err != nil {
-		return nil, errors.New("gateway startup failed")
-	}
-	return client, nil
-}
-
-func (uploader *gcsUploader) upload(ctx context.Context, jpegData []byte, observedAt time.Time) error {
-	uploadContext, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	object := uploader.client.Bucket(uploader.destination.bucket).
-		Object(objectName(uploader.destination.prefix, observedAt)).
-		Retryer(storage.WithPolicy(storage.RetryNever)).
-		If(storage.Conditions{DoesNotExist: true})
-	writer := object.NewWriter(uploadContext)
-	writer.ContentType = "image/jpeg"
-
-	written, err := writer.Write(jpegData)
-	if err != nil {
-		_ = writer.CloseWithError(err)
-		cancel()
-		return deviceFailure{stage: failureStageUpload}
-	}
-	if written != len(jpegData) {
-		_ = writer.CloseWithError(io.ErrShortWrite)
-		cancel()
-		return deviceFailure{stage: failureStageUpload}
-	}
-	if err := writer.Close(); err != nil {
-		return deviceFailure{stage: failureStageUpload}
+func (runtime *deviceRuntime) frameObserved(ctx context.Context, at time.Time) error {
+	runtime.observe(at)
+	if runtime.lastPersistedSeenAt.IsZero() ||
+		runtime.latestObservedAt.Sub(runtime.lastPersistedSeenAt) >= time.Minute {
+		return runtime.persistLatestSeen(ctx)
 	}
 	return nil
+}
+
+func (runtime *deviceRuntime) uploaded(ctx context.Context, capturedAt, completedAt time.Time) error {
+	runtime.observe(capturedAt)
+	if err := runtime.store.markUploaded(
+		ctx,
+		runtime.siteID,
+		runtime.deviceID,
+		capturedAt,
+		completedAt,
+	); err != nil {
+		return failureStageDatabase
+	}
+	runtime.lastPersistedSeenAt = laterTime(runtime.lastPersistedSeenAt, capturedAt)
+	return nil
+}
+
+func (runtime *deviceRuntime) flush(ctx context.Context) error {
+	if runtime.latestObservedAt.IsZero() ||
+		!runtime.latestObservedAt.After(runtime.lastPersistedSeenAt) {
+		return nil
+	}
+	return runtime.persistLatestSeen(ctx)
+}
+
+func (runtime *deviceRuntime) observe(at time.Time) {
+	if at.After(runtime.latestObservedAt) {
+		runtime.latestObservedAt = at
+	}
+}
+
+func (runtime *deviceRuntime) persistLatestSeen(ctx context.Context) error {
+	if err := runtime.store.markFrameSeen(
+		ctx,
+		runtime.siteID,
+		runtime.deviceID,
+		runtime.latestObservedAt,
+	); err != nil {
+		return failureStageDatabase
+	}
+	runtime.lastPersistedSeenAt = runtime.latestObservedAt
+	return nil
+}
+
+func laterTime(left, right time.Time) time.Time {
+	if right.After(left) {
+		return right
+	}
+	return left
 }
