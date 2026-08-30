@@ -239,6 +239,29 @@ func TestWindowsScriptRunsExpectedCommand(t *testing.T) {
 	}
 }
 
+func TestCommissionScriptExposesSiteIDOnlyOperatorCommand(t *testing.T) {
+	data, err := os.ReadFile("commission.cmd")
+	if err != nil {
+		t.Fatalf("read commission.cmd: %v", err)
+	}
+	script := strings.ToLower(strings.ReplaceAll(string(data), "\r\n", "\n"))
+	for _, expected := range []string{
+		"if \"%~1\"==\"\" goto usage",
+		"if not \"%~2\"==\"\" goto usage",
+		"go run ./cmd/commission \"%~1\"",
+		"exit /b %exit_code%",
+	} {
+		if !strings.Contains(script, expected) {
+			t.Errorf("commission.cmd is missing %q", expected)
+		}
+	}
+	for _, forbidden := range []string{"--credentials", "--camera", "camera.yml", "google_application_credentials"} {
+		if strings.Contains(script, forbidden) {
+			t.Errorf("commission.cmd exposes forbidden operator input %q", forbidden)
+		}
+	}
+}
+
 func TestGCSFailureDoesNotExposeDetails(t *testing.T) {
 	secret := errors.New("private-key-data")
 	err := classifyGCSFailure(secret)

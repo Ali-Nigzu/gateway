@@ -166,6 +166,7 @@ func TestComparisonRemainsAgainstLastSuccessfulUpload(t *testing.T) {
 func TestFailedUploadDoesNotChangeBaseline(t *testing.T) {
 	uploadFailure := errors.New("upload failed")
 	uploadAttempts := 0
+	afterUploadCalls := 0
 	processor := newStreamProcessor(
 		0.5,
 		func([]byte) ([]byte, error) { return []byte("jpeg"), nil },
@@ -177,6 +178,10 @@ func TestFailedUploadDoesNotChangeBaseline(t *testing.T) {
 			return nil
 		},
 	)
+	processor.afterUpload = func(context.Context, time.Time, time.Time) error {
+		afterUploadCalls++
+		return nil
+	}
 	baselineFrame := solidRGBFrame(0, 0, 0)
 	failedFrame := solidRGBFrame(255, 255, 255)
 	if accepted, err := processor.process(context.Background(), frameCandidate{rgb: baselineFrame, observedAt: time.Now()}); err != nil || !accepted {
@@ -193,6 +198,44 @@ func TestFailedUploadDoesNotChangeBaseline(t *testing.T) {
 	}
 	if processor.successfulUploads != 1 {
 		t.Fatalf("successful upload count = %d, want 1", processor.successfulUploads)
+	}
+	if afterUploadCalls != 1 {
+		t.Fatalf("database upload callback calls = %d, want only the successful upload", afterUploadCalls)
+	}
+}
+
+func TestSuccessfulUploadAdvancesBaselineBeforeRuntimeFactCallback(t *testing.T) {
+	capturedAt := time.Date(2026, 8, 30, 14, 3, 27, 123456789, time.UTC)
+	completedAt := capturedAt.Add(420 * time.Millisecond)
+	factFailure := errors.New("database runtime fact update failed")
+	uploadCompleted := false
+	processor := newStreamProcessor(
+		0.5,
+		func([]byte) ([]byte, error) { return []byte("jpeg"), nil },
+		func(context.Context, []byte, time.Time) error {
+			uploadCompleted = true
+			return nil
+		},
+	)
+	processor.clock = func() time.Time { return completedAt }
+	processor.afterUpload = func(_ context.Context, captured, completed time.Time) error {
+		if !uploadCompleted || processor.baseline == nil || processor.successfulUploads != 1 {
+			t.Fatal("runtime fact callback ran before GCS success and baseline advancement")
+		}
+		if !captured.Equal(capturedAt) || !completed.Equal(completedAt) {
+			t.Fatalf("callback timestamps = %v, %v", captured, completed)
+		}
+		return factFailure
+	}
+
+	accepted, err := processor.process(context.Background(), frameCandidate{
+		rgb: solidRGBFrame(12, 34, 56), observedAt: capturedAt,
+	})
+	if !accepted || !errors.Is(err, factFailure) {
+		t.Fatalf("process() = accepted %v, error %v", accepted, err)
+	}
+	if processor.baseline == nil || processor.successfulUploads != 1 {
+		t.Fatal("successful GCS object was rolled back after database failure")
 	}
 }
 
@@ -246,8 +289,15 @@ func TestConsumeCommandStreamCancelsAndReapsProcess(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestStreamHelperProcess$")
 	cmd.Env = append(os.Environ(), "CAMOS_STREAM_HELPER=1")
+	started := 0
+	exited := 0
 
-	err := consumeCommandStream(ctx, cmd, time.Now, func(frameCandidate) error {
+	err := consumeCommandStream(ctx, cmd, time.Now, streamLifecycle{
+		started: func(context.Context, time.Time) { started++ },
+		exited: func(context.Context, time.Time, *int) {
+			exited++
+		},
+	}, func(frameCandidate) error {
 		cancel()
 		return nil
 	})
@@ -256,6 +306,9 @@ func TestConsumeCommandStreamCancelsAndReapsProcess(t *testing.T) {
 	}
 	if cmd.ProcessState == nil || !cmd.ProcessState.Exited() {
 		t.Fatalf("helper process was not reaped: state=%v", cmd.ProcessState)
+	}
+	if started != 1 || exited != 1 {
+		t.Fatalf("FFmpeg lifecycle callbacks: started=%d exited=%d", started, exited)
 	}
 }
 

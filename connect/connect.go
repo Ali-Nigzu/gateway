@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -45,15 +44,15 @@ type CameraConfig struct {
 
 // SourceConfig contains the already-resolved RTSP source.
 type SourceConfig struct {
-	URI      string `yaml:"uri"`
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
+	URI      string `json:"uri" yaml:"uri"`
+	Username string `json:"username" yaml:"username"`
+	Password string `json:"password" yaml:"password"`
 }
 
 // CaptureConfig controls the fixed candidate rate and scene-change threshold.
 type CaptureConfig struct {
-	FPS                    int     `yaml:"fps"`
-	ChangeThresholdPercent float64 `yaml:"change_threshold_percent"`
+	FPS                    int     `json:"fps" yaml:"fps"`
+	ChangeThresholdPercent float64 `json:"change_threshold_percent" yaml:"change_threshold_percent"`
 }
 
 // DestinationConfig contains the GCS bucket and optional object prefix.
@@ -64,6 +63,18 @@ type DestinationConfig struct {
 type gcsDestination struct {
 	bucket string
 	prefix string
+}
+
+type cameraCallbacks struct {
+	ffmpegStarted func(context.Context, time.Time)
+	ffmpegExited  func(context.Context, time.Time, *int)
+	connected     func(context.Context, time.Time) error
+	frameObserved func(context.Context, time.Time) error
+	uploaded      func(context.Context, time.Time, time.Time) error
+}
+
+type cameraRunResult struct {
+	successfulUploads int
 }
 
 // LoadConfig reads, decodes, and validates a camera configuration.
@@ -91,48 +102,32 @@ func Connect(ctx context.Context, config CameraConfig) error {
 		return err
 	}
 
-	componentDir, err := componentDirectory()
+	credentialPath, err := serviceAccountPath()
 	if err != nil {
 		return err
 	}
-	credentialPath := filepath.Join(componentDir, "sa.json")
 	if err := requireServiceAccount(credentialPath); err != nil {
 		return err
 	}
 
-	destination, err := parseGCSURI(config.Destination.GCSURI)
-	if err != nil {
-		return errors.New("camera config invalid: destination.gcs_uri must be a gs URI with a bucket")
-	}
-	uploader, err := newGCSUploader(ctx, destination, credentialPath)
+	client, err := newStorageClient(ctx, credentialPath)
 	if err != nil {
 		return err
 	}
-	defer uploader.close()
+	defer client.Close()
 
-	processor := newStreamProcessor(
-		config.Capture.ChangeThresholdPercent,
-		encodeRGBFrame,
-		uploader.upload,
-	)
-	connected := false
-	streamErr := streamRTSP(ctx, config.Source, config.Capture.FPS, time.Now, func(candidate frameCandidate) error {
-		if !connected {
+	result, streamErr := connectCamera(ctx, config, client, cameraCallbacks{
+		connected: func(context.Context, time.Time) error {
 			fmt.Println("RTSP connected")
-			connected = true
-		}
-
-		uploaded, err := processor.process(ctx, candidate)
-		if err != nil {
-			return err
-		}
-		if uploaded {
+			return nil
+		},
+		uploaded: func(context.Context, time.Time, time.Time) error {
 			fmt.Println("Frame uploaded")
-		}
-		return nil
-	})
+			return nil
+		},
+	}, time.Now)
 
-	if ctx.Err() != nil && processor.successfulUploads > 0 {
+	if ctx.Err() != nil && result.successfulUploads > 0 {
 		fmt.Println("Stopped")
 		return nil
 	}
@@ -140,6 +135,65 @@ func Connect(ctx context.Context, config CameraConfig) error {
 		return errors.New("stream stopped before first successful upload: operation cancelled")
 	}
 	return streamErr
+}
+
+func connectCamera(
+	ctx context.Context,
+	config CameraConfig,
+	client *storage.Client,
+	callbacks cameraCallbacks,
+	clock func() time.Time,
+) (cameraRunResult, error) {
+	if err := validateConfig(config); err != nil {
+		return cameraRunResult{}, err
+	}
+
+	destination, err := parseGCSURI(config.Destination.GCSURI)
+	if err != nil {
+		return cameraRunResult{}, errors.New("camera config invalid: destination.gcs_uri must be a gs URI with a bucket")
+	}
+	uploader := &gcsUploader{client: client, destination: destination}
+	processor := newStreamProcessor(
+		config.Capture.ChangeThresholdPercent,
+		encodeRGBFrame,
+		uploader.upload,
+	)
+	processor.clock = clock
+	processor.afterUpload = callbacks.uploaded
+
+	connected := false
+	streamErr := streamRTSP(
+		ctx,
+		config.Source,
+		config.Capture.FPS,
+		clock,
+		streamLifecycle{
+			started: callbacks.ffmpegStarted,
+			exited:  callbacks.ffmpegExited,
+		},
+		func(candidate frameCandidate) error {
+			// FFmpeg exposes no reliable RTSP-handshake callback. The first
+			// complete normalized frame is therefore the earliest trustworthy
+			// boundary at which the stream can be called operational.
+			if !connected {
+				if callbacks.connected != nil {
+					if err := callbacks.connected(ctx, candidate.observedAt); err != nil {
+						return err
+					}
+				}
+				connected = true
+			}
+			if callbacks.frameObserved != nil {
+				if err := callbacks.frameObserved(ctx, candidate.observedAt); err != nil {
+					return err
+				}
+			}
+			_, err := processor.process(ctx, candidate)
+			return err
+		},
+	)
+
+	return cameraRunResult{successfulUploads: processor.successfulUploads}, streamErr
 }
 
 func validateConfig(config CameraConfig) error {
@@ -180,16 +234,12 @@ func validateConfig(config CameraConfig) error {
 	return nil
 }
 
-func componentDirectory() (string, error) {
-	_, sourceFile, _, ok := runtime.Caller(0)
-	if !ok {
-		return "", errors.New("unable to locate connect component directory")
-	}
-	directory, err := filepath.Abs(filepath.Dir(sourceFile))
+func serviceAccountPath() (string, error) {
+	filename, err := filepath.Abs("sa.json")
 	if err != nil {
-		return "", errors.New("unable to locate connect component directory")
+		return "", errors.New("sa.json is not accessible")
 	}
-	return directory, nil
+	return filename, nil
 }
 
 func requireServiceAccount(filename string) error {
@@ -273,12 +323,12 @@ type gcsUploader struct {
 	destination gcsDestination
 }
 
-func newGCSUploader(ctx context.Context, destination gcsDestination, credentialPath string) (*gcsUploader, error) {
+func newStorageClient(ctx context.Context, credentialPath string) (*storage.Client, error) {
 	client, err := storage.NewClient(ctx, option.WithCredentialsFile(credentialPath))
 	if err != nil {
 		return nil, errors.New("GCS authentication failed")
 	}
-	return &gcsUploader{client: client, destination: destination}, nil
+	return client, nil
 }
 
 func (uploader *gcsUploader) upload(ctx context.Context, jpegData []byte, observedAt time.Time) error {
@@ -308,10 +358,6 @@ func (uploader *gcsUploader) upload(ctx context.Context, jpegData []byte, observ
 	}
 
 	return nil
-}
-
-func (uploader *gcsUploader) close() {
-	_ = uploader.client.Close()
 }
 
 func classifyGCSFailure(err error) error {
