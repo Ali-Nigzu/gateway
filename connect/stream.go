@@ -29,11 +29,18 @@ type frameCandidate struct {
 type frameEncoder func([]byte) ([]byte, error)
 type frameUploader func(context.Context, []byte, time.Time) error
 
+type streamLifecycle struct {
+	started func(context.Context, time.Time)
+	exited  func(context.Context, time.Time, *int)
+}
+
 type streamProcessor struct {
 	changeThresholdPercent float64
 	baseline               []byte
 	encode                 frameEncoder
 	upload                 frameUploader
+	clock                  func() time.Time
+	afterUpload            func(context.Context, time.Time, time.Time) error
 	successfulUploads      int
 }
 
@@ -42,6 +49,7 @@ func newStreamProcessor(thresholdPercent float64, encode frameEncoder, upload fr
 		changeThresholdPercent: thresholdPercent,
 		encode:                 encode,
 		upload:                 upload,
+		clock:                  time.Now,
 	}
 }
 
@@ -64,6 +72,12 @@ func (processor *streamProcessor) process(ctx context.Context, candidate frameCa
 
 	processor.baseline = comparison
 	processor.successfulUploads++
+	completedAt := processor.clock().UTC()
+	if processor.afterUpload != nil {
+		if err := processor.afterUpload(ctx, candidate.observedAt, completedAt); err != nil {
+			return true, err
+		}
+	}
 	return true, nil
 }
 
@@ -131,7 +145,14 @@ func ffmpegArguments(sourceURI string, fps int) []string {
 	}
 }
 
-func streamRTSP(ctx context.Context, source SourceConfig, fps int, clock func() time.Time, process func(frameCandidate) error) error {
+func streamRTSP(
+	ctx context.Context,
+	source SourceConfig,
+	fps int,
+	clock func() time.Time,
+	lifecycle streamLifecycle,
+	process func(frameCandidate) error,
+) error {
 	ffmpegPath, err := exec.LookPath("ffmpeg")
 	if err != nil {
 		return errors.New("frame capture/decode failed: ffmpeg not found on PATH")
@@ -143,10 +164,16 @@ func streamRTSP(ctx context.Context, source SourceConfig, fps int, clock func() 
 	}
 
 	cmd := exec.CommandContext(ctx, ffmpegPath, ffmpegArguments(sourceURI, fps)...)
-	return consumeCommandStream(ctx, cmd, clock, process)
+	return consumeCommandStream(ctx, cmd, clock, lifecycle, process)
 }
 
-func consumeCommandStream(ctx context.Context, cmd *exec.Cmd, clock func() time.Time, process func(frameCandidate) error) error {
+func consumeCommandStream(
+	ctx context.Context,
+	cmd *exec.Cmd,
+	clock func() time.Time,
+	lifecycle streamLifecycle,
+	process func(frameCandidate) error,
+) error {
 	stderr := newCappedBuffer(ffmpegErrorLimit)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -157,6 +184,9 @@ func consumeCommandStream(ctx context.Context, cmd *exec.Cmd, clock func() time.
 
 	if err := cmd.Start(); err != nil {
 		return errors.New("frame capture/decode failed: FFmpeg could not start")
+	}
+	if lifecycle.started != nil {
+		lifecycle.started(ctx, clock().UTC())
 	}
 
 	var processingErr error
@@ -170,6 +200,14 @@ func consumeCommandStream(ctx context.Context, cmd *exec.Cmd, clock func() time.
 	_ = cmd.Process.Kill()
 	_ = stdout.Close()
 	waitErr := cmd.Wait()
+	var exitCode *int
+	if cmd.ProcessState != nil {
+		code := cmd.ProcessState.ExitCode()
+		exitCode = &code
+	}
+	if lifecycle.exited != nil {
+		lifecycle.exited(ctx, clock().UTC(), exitCode)
+	}
 
 	if processingErr != nil {
 		return processingErr
