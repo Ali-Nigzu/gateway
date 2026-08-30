@@ -5,14 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
-	"time"
 
 	connect "github.com/Ali-Nigzu/gateway/connect"
 )
-
-const connectTimeout = 60 * time.Second
 
 func main() {
 	os.Exit(run())
@@ -30,8 +28,8 @@ func run() int {
 	}
 	fmt.Println("Config loaded")
 
-	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 
 	if err := connect.Connect(ctx, config); err != nil {
 		return fail(err)

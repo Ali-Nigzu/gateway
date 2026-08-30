@@ -5,6 +5,7 @@ import (
 	"errors"
 	"image/color"
 	"image/jpeg"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -13,23 +14,27 @@ import (
 	"time"
 )
 
-const expectedCameraTemplate = `version: 1
+const expectedCameraTemplate = `version: 2
 
-device_id: 0
-name: ""
+device_id: 1
+name: "Laptop Webcam"
 
 source:
-  uri: ""
+  uri: "rtsp://127.0.0.1:8554/cam"
   username: ""
   password: ""
 
+capture:
+  fps: 3
+  change_threshold_percent: 0.5
+
 destination:
-  gcs_uri: ""
+  gcs_uri: "gs://camostesting/Orgs/Sites/Devices/TestCamera"
 `
 
 func representativeConfig() CameraConfig {
 	return CameraConfig{
-		Version:  1,
+		Version:  2,
 		DeviceID: 1,
 		Name:     "Front Door",
 		Source: SourceConfig{
@@ -37,39 +42,47 @@ func representativeConfig() CameraConfig {
 			Username: "camera-user",
 			Password: "camera-password",
 		},
+		Capture: CaptureConfig{
+			FPS:                    3,
+			ChangeThresholdPercent: 0.5,
+		},
 		Destination: DestinationConfig{
 			GCSURI: "gs://camostesting/Orgs/Sites/Devices/TestCamera",
 		},
 	}
 }
 
-func TestCameraTemplateIsExact(t *testing.T) {
+func TestCameraTemplateIsExactAndValid(t *testing.T) {
 	data, err := os.ReadFile("camera.yml")
 	if err != nil {
 		t.Fatalf("read camera.yml: %v", err)
 	}
 	normalized := strings.ReplaceAll(string(data), "\r\n", "\n")
 	if normalized != expectedCameraTemplate {
-		t.Fatalf("camera.yml does not match the required blank template\nwant:\n%s\ngot:\n%s", expectedCameraTemplate, data)
+		t.Fatalf("camera.yml does not match the required Phase 2 template\nwant:\n%s\ngot:\n%s", expectedCameraTemplate, data)
 	}
-}
 
-func TestBlankCameraTemplateFailsValidation(t *testing.T) {
-	_, err := LoadConfig("camera.yml")
-	if err == nil || !strings.HasPrefix(err.Error(), "camera config invalid:") {
-		t.Fatalf("LoadConfig(camera.yml) error = %v, want camera config invalid", err)
+	config, err := LoadConfig("camera.yml")
+	if err != nil {
+		t.Fatalf("LoadConfig(camera.yml) error = %v", err)
+	}
+	if config.Capture.FPS != 3 || config.Capture.ChangeThresholdPercent != 0.5 {
+		t.Fatalf("capture config = %#v", config.Capture)
 	}
 }
 
 func TestLoadConfigValid(t *testing.T) {
 	filename := filepath.Join(t.TempDir(), "camera.yml")
-	data := `version: 1
+	data := `version: 2
 device_id: 1
 name: "Front Door"
 source:
   uri: "rtsp://192.0.2.10/live"
   username: ""
   password: ""
+capture:
+  fps: 3
+  change_threshold_percent: 0.5
 destination:
   gcs_uri: "gs://camostesting/Orgs/Sites/Devices/TestCamera"
 `
@@ -81,7 +94,7 @@ destination:
 	if err != nil {
 		t.Fatalf("LoadConfig() error = %v", err)
 	}
-	if config.Name != "Front Door" || config.DeviceID != 1 {
+	if config.Version != 2 || config.Name != "Front Door" || config.Capture.FPS != 3 {
 		t.Fatalf("LoadConfig() = %#v", config)
 	}
 }
@@ -91,12 +104,18 @@ func TestValidateConfig(t *testing.T) {
 		name   string
 		mutate func(*CameraConfig)
 	}{
-		{name: "version", mutate: func(config *CameraConfig) { config.Version = 2 }},
+		{name: "version", mutate: func(config *CameraConfig) { config.Version = 1 }},
 		{name: "device", mutate: func(config *CameraConfig) { config.DeviceID = 0 }},
 		{name: "name", mutate: func(config *CameraConfig) { config.Name = " " }},
 		{name: "blank RTSP URI", mutate: func(config *CameraConfig) { config.Source.URI = "" }},
 		{name: "RTSP scheme", mutate: func(config *CameraConfig) { config.Source.URI = "http://192.0.2.10/live" }},
 		{name: "RTSP host", mutate: func(config *CameraConfig) { config.Source.URI = "rtsp:///live" }},
+		{name: "capture FPS low", mutate: func(config *CameraConfig) { config.Capture.FPS = 2 }},
+		{name: "capture FPS high", mutate: func(config *CameraConfig) { config.Capture.FPS = 4 }},
+		{name: "zero threshold", mutate: func(config *CameraConfig) { config.Capture.ChangeThresholdPercent = 0 }},
+		{name: "negative threshold", mutate: func(config *CameraConfig) { config.Capture.ChangeThresholdPercent = -0.1 }},
+		{name: "threshold above 100", mutate: func(config *CameraConfig) { config.Capture.ChangeThresholdPercent = 100.1 }},
+		{name: "NaN threshold", mutate: func(config *CameraConfig) { config.Capture.ChangeThresholdPercent = math.NaN() }},
 		{name: "blank GCS URI", mutate: func(config *CameraConfig) { config.Destination.GCSURI = "" }},
 		{name: "GCS scheme", mutate: func(config *CameraConfig) { config.Destination.GCSURI = "https://bucket/prefix" }},
 		{name: "GCS bucket", mutate: func(config *CameraConfig) { config.Destination.GCSURI = "gs:///prefix" }},
@@ -146,24 +165,6 @@ func TestAuthenticatedRTSPURI(t *testing.T) {
 	}
 }
 
-func TestFFmpegArguments(t *testing.T) {
-	args := strings.Join(ffmpegArguments("rtsp://camera.example/live"), " ")
-	for _, required := range []string{
-		"-rtsp_transport tcp",
-		"-frames:v 1",
-		"scale=1280:720:force_original_aspect_ratio=decrease",
-		"pad=1280:720:(ow-iw)/2:(oh-ih)/2:black",
-		"format=rgb24",
-		"-f rawvideo",
-		"-pix_fmt rgb24",
-		"pipe:1",
-	} {
-		if !strings.Contains(args, required) {
-			t.Errorf("FFmpeg arguments missing %q", required)
-		}
-	}
-}
-
 func TestFFmpegErrorsDoNotLeakCredentials(t *testing.T) {
 	diagnostic := "Unable to open rtsp://camera-user:camera-password@camera.example/live: authentication failed"
 	err := classifyFFmpegFailure(diagnostic)
@@ -182,13 +183,7 @@ func TestEncodeRGBFrameRejectsWrongSize(t *testing.T) {
 }
 
 func TestEncodeRGBFrameProduces1280x720JPEG(t *testing.T) {
-	rgb := make([]byte, rawFrameSize)
-	for offset := 0; offset < len(rgb); offset += 3 {
-		rgb[offset] = 210
-		rgb[offset+1] = 80
-		rgb[offset+2] = 35
-	}
-
+	rgb := solidRGBFrame(210, 80, 35)
 	encoded, err := encodeRGBFrame(rgb)
 	if err != nil {
 		t.Fatalf("encodeRGBFrame() error = %v", err)
@@ -208,15 +203,19 @@ func TestEncodeRGBFrameProduces1280x720JPEG(t *testing.T) {
 	}
 }
 
-func TestObjectName(t *testing.T) {
-	first := objectName("Orgs/Sites/Devices/TestCamera", time.Date(2026, 8, 28, 15, 30, 0, 123456789, time.UTC))
-	second := objectName("Orgs/Sites/Devices/TestCamera", time.Date(2026, 8, 28, 15, 30, 0, 123456790, time.UTC))
-	want := "Orgs/Sites/Devices/TestCamera/connect-test-20260828T153000.123456789Z.jpg"
-	if first != want {
-		t.Fatalf("objectName() = %q, want %q", first, want)
+func TestObjectNameUsesExactLoaderFormat(t *testing.T) {
+	timestamp := time.Date(2026, 8, 30, 15, 3, 27, 123456789, time.FixedZone("BST", 60*60))
+	got := objectName("Orgs/Sites/Devices/TestCamera", timestamp)
+	want := "Orgs/Sites/Devices/TestCamera/2026-08-30T14-03-27.123456Z.jpg"
+	if got != want {
+		t.Fatalf("objectName() = %q, want %q", got, want)
 	}
-	if first == second {
-		t.Fatal("different timestamps produced the same object name")
+	basename := filepath.Base(got)
+	if strings.Contains(basename, "connect-test-") {
+		t.Fatalf("temporary Phase 1 prefix remains in %q", basename)
+	}
+	if strings.TrimSuffix(basename, ".jpg")+".jpg" != basename || strings.Count(basename, ".") != 2 {
+		t.Fatalf("filename has an unexpected suffix: %q", basename)
 	}
 }
 
