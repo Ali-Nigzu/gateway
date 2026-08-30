@@ -26,62 +26,38 @@ const (
 )
 
 const (
-	eventGatewayCommissioningStarted = "gateway.commissioning_started"
-	eventGatewayDatabaseConnected    = "gateway.database_connected"
-	eventGatewaySiteLoaded           = "gateway.site_loaded"
-	eventGatewayCommissioningFailed  = "gateway.commissioning_failed"
-	eventGatewayShutdownRequested    = "gateway.shutdown_requested"
-	eventGatewayShutdownCompleted    = "gateway.shutdown_completed"
-	eventGatewayShutdownFailed       = "gateway.shutdown_failed"
+	eventGatewayStarted = "gateway.started"
+	eventDeviceStarted  = "device.started"
+	eventDeviceFailed   = "device.failed"
+	eventDeviceStopped  = "device.stopped"
+	eventGatewayStopped = "gateway.stopped"
 
-	eventDeviceConfigurationInvalid  = "device.configuration_invalid"
-	eventDeviceWorkerSkipped         = "device.worker_skipped"
-	eventDeviceWorkerStarted         = "device.worker_started"
-	eventDeviceRTSPConnectionAttempt = "device.rtsp_connection_attempt"
-	eventDeviceRTSPConnected         = "device.rtsp_connected"
-	eventDeviceRTSPFailed            = "device.rtsp_failed"
-	eventDeviceFFmpegStarted         = "device.ffmpeg_started"
-	eventDeviceFFmpegExited          = "device.ffmpeg_exited"
-	eventDeviceFramePipelineFailed   = "device.frame_pipeline_failed"
-	eventDeviceGCSUploadFailed       = "device.gcs_upload_failed"
-	eventDeviceDatabaseWriteFailed   = "device.database_write_failed"
-	eventDeviceWorkerStopped         = "device.worker_stopped"
+	failureStageStream   = "stream"
+	failureStageUpload   = "upload"
+	failureStageDatabase = "database"
+	failureStageCrash    = "crash"
 )
 
-var errSiteNotFound = errors.New("site not found")
-
 type siteRecord struct {
-	ID     int64
-	Name   string
-	Status string
+	id     int64
+	status string
 }
 
 type deviceRecord struct {
-	ID            int64
-	Name          string
-	SiteID        int64
-	Status        string
-	GCSURI        string
-	RTSPConfig    []byte
-	CaptureConfig []byte
+	id            int64
+	status        string
+	gcsURI        string
+	rtspConfig    []byte
+	captureConfig []byte
 }
 
 type gatewayEvent struct {
-	SiteID     int64
-	DeviceID   *int64
-	OccurredAt time.Time
-	Type       string
-	Message    string
-	Details    map[string]any
-}
-
-type gatewayStore interface {
-	LoadSite(context.Context, int64) (siteRecord, []deviceRecord, error)
-	RecordEvent(context.Context, gatewayEvent) error
-	MarkConnected(context.Context, int64, int64, time.Time) error
-	AdvanceFrameSeen(context.Context, int64, int64, time.Time) error
-	MarkUploaded(context.Context, int64, int64, time.Time, time.Time) error
-	Close() error
+	siteID     int64
+	deviceID   *int64
+	occurredAt time.Time
+	eventType  string
+	message    string
+	stage      string
 }
 
 type postgresStore struct {
@@ -89,7 +65,7 @@ type postgresStore struct {
 	dialer   *cloudsqlconn.Dialer
 }
 
-func newPostgresStore(ctx context.Context, credentialPath string) (gatewayStore, error) {
+func newPostgresStore(ctx context.Context, credentialPath string) (*postgresStore, error) {
 	email, err := serviceAccountEmail(credentialPath)
 	if err != nil {
 		return nil, err
@@ -102,13 +78,13 @@ func newPostgresStore(ctx context.Context, credentialPath string) (gatewayStore,
 		cloudsqlconn.WithIAMAuthN(),
 	)
 	if err != nil {
-		return nil, errors.New("Cloud SQL authentication failed")
+		return nil, errors.New("database startup failed")
 	}
 
 	config, err := pgx.ParseConfig("sslmode=disable")
 	if err != nil {
 		_ = dialer.Close()
-		return nil, errors.New("Cloud SQL configuration failed")
+		return nil, errors.New("database startup failed")
 	}
 	config.User = databaseUser
 	config.Database = cloudSQLDatabase
@@ -125,7 +101,7 @@ func newPostgresStore(ctx context.Context, credentialPath string) (gatewayStore,
 	if err := database.PingContext(ctx); err != nil {
 		_ = database.Close()
 		_ = dialer.Close()
-		return nil, errors.New("Cloud SQL connection failed")
+		return nil, errors.New("database startup failed")
 	}
 
 	return &postgresStore{database: database, dialer: dialer}, nil
@@ -134,19 +110,15 @@ func newPostgresStore(ctx context.Context, credentialPath string) (gatewayStore,
 func serviceAccountEmail(filename string) (string, error) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
-		return "", errors.New("sa.json is not accessible")
+		return "", errors.New("sa.json unavailable")
 	}
 	var metadata struct {
 		ClientEmail string `json:"client_email"`
 	}
 	if err := json.Unmarshal(data, &metadata); err != nil {
-		return "", errors.New("sa.json is invalid")
+		return "", errors.New("sa.json unavailable")
 	}
-	email := strings.TrimSpace(metadata.ClientEmail)
-	if email == "" || email != strings.ToLower(email) || !strings.HasSuffix(email, ".gserviceaccount.com") {
-		return "", errors.New("sa.json is invalid")
-	}
-	return email, nil
+	return strings.TrimSpace(metadata.ClientEmail), nil
 }
 
 func (store *postgresStore) LoadSite(ctx context.Context, siteID int64) (siteRecord, []deviceRecord, error) {
@@ -155,89 +127,83 @@ func (store *postgresStore) LoadSite(ctx context.Context, siteID int64) (siteRec
 		ReadOnly:  true,
 	})
 	if err != nil {
-		return siteRecord{}, nil, errors.New("database configuration read failed")
+		return siteRecord{}, nil, errors.New("site load failed")
 	}
 	defer transaction.Rollback()
 
 	var site siteRecord
-	err = transaction.QueryRowContext(
+	if err := transaction.QueryRowContext(
 		ctx,
-		`SELECT id, name, status
+		`SELECT id, status
 FROM public.sites
 WHERE id = $1`,
 		siteID,
-	).Scan(&site.ID, &site.Name, &site.Status)
-	if errors.Is(err, sql.ErrNoRows) {
-		return siteRecord{}, nil, errSiteNotFound
-	}
-	if err != nil {
-		return siteRecord{}, nil, errors.New("database site configuration query failed")
+	).Scan(&site.id, &site.status); err != nil {
+		return siteRecord{}, nil, errors.New("site load failed")
 	}
 
 	rows, err := transaction.QueryContext(
 		ctx,
-		`SELECT id, name, site_id, status, gcs_source_uri, rtsp_config, capture_config
+		`SELECT id, status, gcs_source_uri, rtsp_config, capture_config
 FROM public.devices
 WHERE site_id = $1
 ORDER BY id`,
 		siteID,
 	)
 	if err != nil {
-		return siteRecord{}, nil, errors.New("database Device configuration query failed")
+		return siteRecord{}, nil, errors.New("site load failed")
 	}
-	defer rows.Close()
 
 	devices := make([]deviceRecord, 0)
 	for rows.Next() {
 		var device deviceRecord
 		var gcsURI sql.NullString
 		if err := rows.Scan(
-			&device.ID,
-			&device.Name,
-			&device.SiteID,
-			&device.Status,
+			&device.id,
+			&device.status,
 			&gcsURI,
-			&device.RTSPConfig,
-			&device.CaptureConfig,
+			&device.rtspConfig,
+			&device.captureConfig,
 		); err != nil {
-			return siteRecord{}, nil, errors.New("database Device configuration query failed")
+			_ = rows.Close()
+			return siteRecord{}, nil, errors.New("site load failed")
 		}
 		if gcsURI.Valid {
-			device.GCSURI = gcsURI.String
+			device.gcsURI = gcsURI.String
 		}
 		devices = append(devices, device)
 	}
 	if err := rows.Err(); err != nil {
-		return siteRecord{}, nil, errors.New("database Device configuration query failed")
+		_ = rows.Close()
+		return siteRecord{}, nil, errors.New("site load failed")
 	}
 	if err := rows.Close(); err != nil {
-		return siteRecord{}, nil, errors.New("database Device configuration query failed")
+		return siteRecord{}, nil, errors.New("site load failed")
 	}
 	if err := transaction.Commit(); err != nil {
-		return siteRecord{}, nil, errors.New("database configuration read failed")
+		return siteRecord{}, nil, errors.New("site load failed")
 	}
 
 	return site, devices, nil
 }
 
 func (store *postgresStore) RecordEvent(ctx context.Context, event gatewayEvent) error {
-	if !knownEventType(event.Type) || !safeEventDetails(event.Details) {
-		return errors.New("gateway log event invalid")
-	}
-	details := event.Details
-	if details == nil {
-		details = map[string]any{}
-	}
-	encoded, err := json.Marshal(details)
-	if err != nil {
-		return errors.New("gateway log event invalid")
+	details := `{}`
+	if event.stage != "" {
+		encoded, err := json.Marshal(struct {
+			Stage string `json:"stage"`
+		}{Stage: event.stage})
+		if err != nil {
+			return errors.New("gateway log write failed")
+		}
+		details = string(encoded)
 	}
 
 	var deviceID any
-	if event.DeviceID != nil {
-		deviceID = *event.DeviceID
+	if event.deviceID != nil {
+		deviceID = *event.deviceID
 	}
-	_, err = store.database.ExecContext(
+	_, err := store.database.ExecContext(
 		ctx,
 		`INSERT INTO public.gateway_logs (
     site_id,
@@ -248,12 +214,12 @@ func (store *postgresStore) RecordEvent(ctx context.Context, event gatewayEvent)
     details
 )
 VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
-		event.SiteID,
+		event.siteID,
 		deviceID,
-		event.OccurredAt.UTC(),
-		event.Type,
-		event.Message,
-		string(encoded),
+		event.occurredAt.UTC(),
+		event.eventType,
+		event.message,
+		details,
 	)
 	if err != nil {
 		return errors.New("gateway log write failed")
@@ -275,7 +241,7 @@ WHERE id = $1
 		observedAt.UTC(),
 	)
 	if err != nil || !exactlyOneRow(result) {
-		return errors.New("database runtime fact update failed")
+		return errors.New("database runtime write failed")
 	}
 	return nil
 }
@@ -292,7 +258,7 @@ WHERE id = $1
 		observedAt.UTC(),
 	)
 	if err != nil || !exactlyOneRow(result) {
-		return errors.New("database runtime fact update failed")
+		return errors.New("database runtime write failed")
 	}
 	return nil
 }
@@ -304,7 +270,7 @@ func (store *postgresStore) MarkUploaded(
 ) error {
 	transaction, err := store.database.BeginTx(ctx, nil)
 	if err != nil {
-		return errors.New("database upload fact transaction failed")
+		return errors.New("database runtime write failed")
 	}
 	defer transaction.Rollback()
 
@@ -322,7 +288,7 @@ WHERE id = $1
 		completedAt.UTC(),
 	)
 	if err != nil || !exactlyOneRow(deviceResult) {
-		return errors.New("database upload fact transaction failed")
+		return errors.New("database runtime write failed")
 	}
 
 	siteResult, err := transaction.ExecContext(
@@ -336,10 +302,10 @@ WHERE id = $1`,
 		completedAt.UTC(),
 	)
 	if err != nil || !exactlyOneRow(siteResult) {
-		return errors.New("database upload fact transaction failed")
+		return errors.New("database runtime write failed")
 	}
 	if err := transaction.Commit(); err != nil {
-		return errors.New("database upload fact transaction failed")
+		return errors.New("database runtime write failed")
 	}
 	return nil
 }
@@ -355,52 +321,8 @@ func exactlyOneRow(result sql.Result) bool {
 func (store *postgresStore) Close() error {
 	databaseErr := store.database.Close()
 	dialerErr := store.dialer.Close()
-	return errors.Join(databaseErr, dialerErr)
-}
-
-func knownEventType(eventType string) bool {
-	switch eventType {
-	case eventGatewayCommissioningStarted,
-		eventGatewayDatabaseConnected,
-		eventGatewaySiteLoaded,
-		eventGatewayCommissioningFailed,
-		eventGatewayShutdownRequested,
-		eventGatewayShutdownCompleted,
-		eventGatewayShutdownFailed,
-		eventDeviceConfigurationInvalid,
-		eventDeviceWorkerSkipped,
-		eventDeviceWorkerStarted,
-		eventDeviceRTSPConnectionAttempt,
-		eventDeviceRTSPConnected,
-		eventDeviceRTSPFailed,
-		eventDeviceFFmpegStarted,
-		eventDeviceFFmpegExited,
-		eventDeviceFramePipelineFailed,
-		eventDeviceGCSUploadFailed,
-		eventDeviceDatabaseWriteFailed,
-		eventDeviceWorkerStopped:
-		return true
-	default:
-		return false
+	if databaseErr != nil || dialerErr != nil {
+		return errors.New("gateway shutdown failed")
 	}
-}
-
-func safeEventDetails(details map[string]any) bool {
-	for key, value := range details {
-		switch key {
-		case "reason_code", "site_status", "device_status":
-			if _, ok := value.(string); !ok {
-				return false
-			}
-		case "ffmpeg_exit_code", "received_bytes", "worker_count", "valid_devices", "invalid_devices", "disabled_devices":
-			switch value.(type) {
-			case int, int32, int64:
-			default:
-				return false
-			}
-		default:
-			return false
-		}
-	}
-	return true
+	return nil
 }

@@ -2,12 +2,9 @@ package connect
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"io"
 	"os/exec"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -26,30 +23,22 @@ type frameCandidate struct {
 	observedAt time.Time
 }
 
-type frameEncoder func([]byte) ([]byte, error)
-type frameUploader func(context.Context, []byte, time.Time) error
-
-type streamLifecycle struct {
-	started func(context.Context, time.Time)
-	exited  func(context.Context, time.Time, *int)
-}
-
 type streamProcessor struct {
 	changeThresholdPercent float64
 	baseline               []byte
-	encode                 frameEncoder
-	upload                 frameUploader
-	clock                  func() time.Time
-	afterUpload            func(context.Context, time.Time, time.Time) error
-	successfulUploads      int
+	uploader               *gcsUploader
+	observer               *deviceObserver
 }
 
-func newStreamProcessor(thresholdPercent float64, encode frameEncoder, upload frameUploader) *streamProcessor {
+func newStreamProcessor(
+	thresholdPercent float64,
+	uploader *gcsUploader,
+	observer *deviceObserver,
+) *streamProcessor {
 	return &streamProcessor{
 		changeThresholdPercent: thresholdPercent,
-		encode:                 encode,
-		upload:                 upload,
-		clock:                  time.Now,
+		uploader:               uploader,
+		observer:               observer,
 	}
 }
 
@@ -62,28 +51,28 @@ func (processor *streamProcessor) process(ctx context.Context, candidate frameCa
 		return false, nil
 	}
 
-	jpegData, err := processor.encode(candidate.rgb)
+	jpegData, err := encodeRGBFrame(candidate.rgb)
 	if err != nil {
 		return false, err
 	}
-	if err := processor.upload(ctx, jpegData, candidate.observedAt); err != nil {
+	if err := processor.uploader.upload(ctx, jpegData, candidate.observedAt); err != nil {
 		return false, err
 	}
 
+	// The image is durably uploaded before the baseline advances or database
+	// facts are updated. A failed database update cannot cause a second object
+	// write for the same captured frame.
 	processor.baseline = comparison
-	processor.successfulUploads++
-	completedAt := processor.clock().UTC()
-	if processor.afterUpload != nil {
-		if err := processor.afterUpload(ctx, candidate.observedAt, completedAt); err != nil {
-			return true, err
-		}
+	completedAt := time.Now().UTC()
+	if err := processor.observer.uploaded(ctx, candidate.observedAt, completedAt); err != nil {
+		return true, err
 	}
 	return true, nil
 }
 
 func comparisonFrame(rgb []byte) ([]byte, error) {
 	if len(rgb) != rawFrameSize {
-		return nil, fmt.Errorf("frame capture/decode failed: expected %d RGB24 bytes, received %d", rawFrameSize, len(rgb))
+		return nil, deviceFailure{stage: failureStageStream}
 	}
 
 	comparison := make([]byte, comparisonCellCount)
@@ -147,15 +136,13 @@ func ffmpegArguments(sourceURI string, fps int) []string {
 
 func streamRTSP(
 	ctx context.Context,
-	source SourceConfig,
+	source sourceConfig,
 	fps int,
-	clock func() time.Time,
-	lifecycle streamLifecycle,
 	process func(frameCandidate) error,
 ) error {
 	ffmpegPath, err := exec.LookPath("ffmpeg")
 	if err != nil {
-		return errors.New("frame capture/decode failed: ffmpeg not found on PATH")
+		return deviceFailure{stage: failureStageStream}
 	}
 
 	sourceURI, err := authenticatedRTSPURI(source)
@@ -164,83 +151,40 @@ func streamRTSP(
 	}
 
 	cmd := exec.CommandContext(ctx, ffmpegPath, ffmpegArguments(sourceURI, fps)...)
-	return consumeCommandStream(ctx, cmd, clock, lifecycle, process)
+	return consumeCommandStream(ctx, cmd, process)
 }
 
 func consumeCommandStream(
 	ctx context.Context,
 	cmd *exec.Cmd,
-	clock func() time.Time,
-	lifecycle streamLifecycle,
 	process func(frameCandidate) error,
 ) error {
-	stderr := newCappedBuffer(ffmpegErrorLimit)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return errors.New("frame capture/decode failed: unable to open FFmpeg output")
+		return deviceFailure{stage: failureStageStream}
 	}
-	cmd.Stderr = stderr
+	cmd.Stderr = io.Discard
 	cmd.WaitDelay = processWaitDelay
 
 	if err := cmd.Start(); err != nil {
-		return errors.New("frame capture/decode failed: FFmpeg could not start")
-	}
-	if lifecycle.started != nil {
-		lifecycle.started(ctx, clock().UTC())
+		return deviceFailure{stage: failureStageStream}
 	}
 
-	var processingErr error
-	readErr := readRGBFrames(ctx, stdout, clock, func(candidate frameCandidate) error {
-		processingErr = process(candidate)
-		return processingErr
-	})
+	readErr := readRGBFrames(ctx, stdout, process)
 
 	// readRGBFrames only returns when the stream, context, or processing stops.
 	// Kill is harmless for an already-exited child; Wait always reaps it.
 	_ = cmd.Process.Kill()
 	_ = stdout.Close()
-	waitErr := cmd.Wait()
-	var exitCode *int
-	if cmd.ProcessState != nil {
-		code := cmd.ProcessState.ExitCode()
-		exitCode = &code
-	}
-	if lifecycle.exited != nil {
-		lifecycle.exited(ctx, clock().UTC(), exitCode)
-	}
+	_ = cmd.Wait()
 
-	if processingErr != nil {
-		return processingErr
-	}
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if isIncompleteFrameError(readErr) {
-		return readErr
-	}
-	if waitErr != nil {
-		return classifyFFmpegFailure(stderr.String())
-	}
-	if readErr != nil {
-		return readErr
-	}
-	return errors.New("RTSP stream ended unexpectedly")
+	return readErr
 }
 
-type incompleteFrameError struct {
-	received int
-}
-
-func (err incompleteFrameError) Error() string {
-	return fmt.Sprintf("frame capture/decode failed: incomplete RGB24 frame: expected %d bytes, received %d", rawFrameSize, err.received)
-}
-
-func isIncompleteFrameError(err error) bool {
-	var incomplete incompleteFrameError
-	return errors.As(err, &incomplete)
-}
-
-func readRGBFrames(ctx context.Context, reader io.Reader, clock func() time.Time, process func(frameCandidate) error) error {
+func readRGBFrames(ctx context.Context, reader io.Reader, process func(frameCandidate) error) error {
 	frame := make([]byte, rawFrameSize)
 	for {
 		select {
@@ -249,55 +193,17 @@ func readRGBFrames(ctx context.Context, reader io.Reader, clock func() time.Time
 		default:
 		}
 
-		bytesRead, err := io.ReadFull(reader, frame)
+		_, err := io.ReadFull(reader, frame)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if bytesRead > 0 {
-				return incompleteFrameError{received: bytesRead}
-			}
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return errors.New("RTSP stream ended unexpectedly")
-			}
-			return errors.New("frame capture/decode failed: unable to read FFmpeg output")
+			return deviceFailure{stage: failureStageStream}
 		}
 
-		candidate := frameCandidate{rgb: frame, observedAt: clock().UTC()}
+		candidate := frameCandidate{rgb: frame, observedAt: time.Now().UTC()}
 		if err := process(candidate); err != nil {
 			return err
 		}
 	}
-}
-
-func classifyFFmpegFailure(diagnostic string) error {
-	lower := strings.ToLower(diagnostic)
-	authenticationMarkers := []string{
-		"401 unauthorized",
-		"401 (unauthorized)",
-		"authentication failed",
-		"server returned 401",
-		"method describe failed: 401",
-	}
-	for _, marker := range authenticationMarkers {
-		if strings.Contains(lower, marker) {
-			return errors.New("RTSP authentication failed")
-		}
-	}
-
-	connectionMarkers := []string{
-		"connection refused",
-		"connection timed out",
-		"could not connect",
-		"network is unreachable",
-		"no route to host",
-		"unable to open resource",
-	}
-	for _, marker := range connectionMarkers {
-		if strings.Contains(lower, marker) {
-			return errors.New("RTSP connection failed")
-		}
-	}
-
-	return errors.New("frame capture/decode failed")
 }
