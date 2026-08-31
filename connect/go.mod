@@ -1,4 +1,4 @@
-module github.com/Ali-Nigzu/gateway/connect
+module camos-gateway
 
 go 1.22.7
 
