@@ -72,35 +72,39 @@ func streamRTSP(
 	ctx context.Context,
 	sourceURI string,
 	fps int,
+	frame []byte,
 	process func([]byte, time.Time) error,
 ) error {
-	cmd := exec.CommandContext(ctx, "ffmpeg", ffmpegArguments(sourceURI, fps)...)
+	attemptCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	cmd := exec.CommandContext(attemptCtx, "ffmpeg", ffmpegArguments(sourceURI, fps)...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return failureStageStream
+		return err
 	}
 	if err := cmd.Start(); err != nil {
-		return failureStageStream
+		return err
 	}
 	defer func() {
+		cancel()
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 	}()
 
-	frame := make([]byte, rawFrameSize)
+	silence := time.AfterFunc(frameSilenceTimeout, cancel)
+	defer silence.Stop()
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
 		if _, err := io.ReadFull(stdout, frame); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return failureStageStream
+			return err
 		}
+		if err := attemptCtx.Err(); err != nil {
+			return err
+		}
+		if !silence.Stop() {
+			return context.DeadlineExceeded
+		}
+		silence.Reset(frameSilenceTimeout)
 		if err := process(frame, time.Now().UTC()); err != nil {
 			return err
 		}
