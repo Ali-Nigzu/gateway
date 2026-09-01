@@ -1,14 +1,12 @@
-module github.com/Ali-Nigzu/gateway/connect
+module camos-gateway
 
 go 1.22.7
 
 require (
 	cloud.google.com/go/cloudsqlconn v1.14.2
 	cloud.google.com/go/storage v1.50.0
-	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/jackc/pgx/v5 v5.7.2
 	google.golang.org/api v0.221.0
-	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
