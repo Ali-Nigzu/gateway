@@ -301,13 +301,11 @@ func uploadCompletionMayBeAmbiguous(err error) bool {
 
 func superviseRuntimeFacts(
 	ctx context.Context,
-	siteID int64,
 	store *postgresStore,
 	statement string,
 	runtimes []*deviceRuntime,
 ) {
-	arguments := make([]any, 1+4*len(runtimes))
-	arguments[0] = siteID
+	arguments := make([]any, 4*len(runtimes))
 	for {
 		success := writeRuntimeFactsSafely(ctx, store, statement, arguments, runtimes)
 		if ctx.Err() != nil {
@@ -338,7 +336,7 @@ func writeRuntimeFactsSafely(
 
 	for index, runtime := range runtimes {
 		snapshot := runtime.facts.snapshot()
-		argument := 1 + index*4
+		argument := index * 4
 		arguments[argument] = runtime.config.id
 		arguments[argument+1] = nullableTime(snapshot.connectedAt)
 		arguments[argument+2] = nullableTime(snapshot.seenAt)

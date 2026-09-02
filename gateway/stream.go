@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"time"
 )
@@ -78,7 +80,12 @@ func streamRTSP(
 	attemptCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	cmd := exec.CommandContext(attemptCtx, "ffmpeg", ffmpegArguments(sourceURI, fps)...)
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	ffmpegPath := filepath.Join(filepath.Dir(executable), ffmpegExecutableName)
+	cmd := exec.CommandContext(attemptCtx, ffmpegPath, ffmpegArguments(sourceURI, fps)...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err

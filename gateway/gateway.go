@@ -63,14 +63,17 @@ func startGateway(ctx context.Context, siteID int64) error {
 	for index := range devices {
 		runtimes[index] = newDeviceRuntime(devices[index])
 	}
-	factStatement := runtimeFactStatement(len(runtimes))
 
 	var workers sync.WaitGroup
-	workers.Add(1 + 2*len(runtimes))
-	go func() {
-		defer workers.Done()
-		superviseRuntimeFacts(ctx, siteID, store, factStatement, runtimes)
-	}()
+	workers.Add(2 * len(runtimes))
+	if len(runtimes) != 0 {
+		factStatement := runtimeFactStatement(len(runtimes))
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			superviseRuntimeFacts(ctx, store, factStatement, runtimes)
+		}()
+	}
 	for _, runtime := range runtimes {
 		go func() {
 			defer workers.Done()

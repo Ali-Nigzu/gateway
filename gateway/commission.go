@@ -1,10 +1,15 @@
 package main
 
-import "context"
+import (
+	"errors"
 
-func commission(ctx context.Context, siteID int64) error {
-	if err := saveSiteID(siteID); err != nil {
-		return err
+	"github.com/google/uuid"
+)
+
+func commission(value string) error {
+	gatewayID, err := uuid.Parse(value)
+	if err != nil {
+		return errors.New("gateway ID must be a UUID")
 	}
-	return startGateway(ctx, siteID)
+	return installService(gatewayID)
 }
