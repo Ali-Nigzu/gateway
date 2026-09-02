@@ -5,6 +5,7 @@ go 1.22.7
 require (
 	cloud.google.com/go/cloudsqlconn v1.14.2
 	cloud.google.com/go/storage v1.50.0
+	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.7.2
 	golang.org/x/oauth2 v0.26.0
 	golang.org/x/sys v0.30.0
@@ -31,7 +32,6 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.4 // indirect
 	github.com/googleapis/gax-go/v2 v2.14.1 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect

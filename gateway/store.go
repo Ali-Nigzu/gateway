@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/cloudsqlconn"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 )
@@ -104,14 +105,35 @@ ORDER BY d.id`,
 	return devices, nil
 }
 
-func runtimeFactStatement(deviceCount int) string {
-	if deviceCount == 0 {
-		return `UPDATE public.sites
-SET gateway_last_seen_at = GREATEST(
-    COALESCE(gateway_last_seen_at, CURRENT_TIMESTAMP),
+func (store *postgresStore) refreshGatewayControl(
+	ctx context.Context,
+	gatewayID uuid.UUID,
+) (gatewayControl, error) {
+	var control gatewayControl
+	err := store.database.QueryRowContext(
+		ctx,
+		`UPDATE public.gateways
+SET last_seen_at = GREATEST(
+    COALESCE(last_seen_at, CURRENT_TIMESTAMP),
     CURRENT_TIMESTAMP
 )
-WHERE id = $1`
+WHERE gateway_id = $1::uuid
+RETURNING site_id, desired_state, restart_requested_at`,
+		gatewayID,
+	).Scan(
+		&control.siteID,
+		&control.desiredState,
+		&control.restartRequestedAt,
+	)
+	if err != nil {
+		return gatewayControl{}, errors.New("gateway control failed")
+	}
+	return control, nil
+}
+
+func runtimeFactStatement(deviceCount int) string {
+	if deviceCount == 0 {
+		return ""
 	}
 
 	var statement strings.Builder
@@ -122,7 +144,7 @@ WHERE id = $1`
 		if index != 0 {
 			statement.WriteString(",\n")
 		}
-		firstParameter := 2 + index*4
+		firstParameter := 1 + index*4
 		fmt.Fprintf(
 			&statement,
 			"        ($%d::bigint, $%d::timestamptz, $%d::timestamptz, $%d::timestamptz)",
@@ -133,37 +155,28 @@ WHERE id = $1`
 		)
 	}
 	statement.WriteString(`
-),
-updated_devices AS (
-    UPDATE public.devices AS d
-    SET
-        last_connected_at = CASE
-            WHEN f.connected_at IS NULL THEN d.last_connected_at
-            ELSE GREATEST(COALESCE(d.last_connected_at, f.connected_at), f.connected_at)
-        END,
-        last_frame_seen_at = CASE
-            WHEN f.seen_at IS NULL THEN d.last_frame_seen_at
-            ELSE GREATEST(COALESCE(d.last_frame_seen_at, f.seen_at), f.seen_at)
-        END,
-        last_frame_uploaded_at = CASE
-            WHEN f.uploaded_at IS NULL THEN d.last_frame_uploaded_at
-            ELSE GREATEST(COALESCE(d.last_frame_uploaded_at, f.uploaded_at), f.uploaded_at)
-        END
-    FROM current_facts AS f
-    WHERE d.id = f.device_id
-      AND d.site_id = $1
-      AND (
-          (f.connected_at IS NOT NULL AND (d.last_connected_at IS NULL OR d.last_connected_at < f.connected_at))
-          OR (f.seen_at IS NOT NULL AND (d.last_frame_seen_at IS NULL OR d.last_frame_seen_at < f.seen_at))
-          OR (f.uploaded_at IS NOT NULL AND (d.last_frame_uploaded_at IS NULL OR d.last_frame_uploaded_at < f.uploaded_at))
-      )
 )
-UPDATE public.sites
-SET gateway_last_seen_at = GREATEST(
-    COALESCE(gateway_last_seen_at, CURRENT_TIMESTAMP),
-    CURRENT_TIMESTAMP
-)
-WHERE id = $1`)
+UPDATE public.devices AS d
+SET
+    last_connected_at = CASE
+        WHEN f.connected_at IS NULL THEN d.last_connected_at
+        ELSE GREATEST(COALESCE(d.last_connected_at, f.connected_at), f.connected_at)
+    END,
+    last_frame_seen_at = CASE
+        WHEN f.seen_at IS NULL THEN d.last_frame_seen_at
+        ELSE GREATEST(COALESCE(d.last_frame_seen_at, f.seen_at), f.seen_at)
+    END,
+    last_frame_uploaded_at = CASE
+        WHEN f.uploaded_at IS NULL THEN d.last_frame_uploaded_at
+        ELSE GREATEST(COALESCE(d.last_frame_uploaded_at, f.uploaded_at), f.uploaded_at)
+    END
+FROM current_facts AS f
+WHERE d.id = f.device_id
+  AND (
+      (f.connected_at IS NOT NULL AND (d.last_connected_at IS NULL OR d.last_connected_at < f.connected_at))
+      OR (f.seen_at IS NOT NULL AND (d.last_frame_seen_at IS NULL OR d.last_frame_seen_at < f.seen_at))
+      OR (f.uploaded_at IS NOT NULL AND (d.last_frame_uploaded_at IS NULL OR d.last_frame_uploaded_at < f.uploaded_at))
+  )`)
 	return statement.String()
 }
 
