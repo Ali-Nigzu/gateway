@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build linux
 
 package main
 
@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	gatewayIdentityDirectory = "/Library/Application Support/camOS Gateway"
+	gatewayIdentityDirectory = "/var/lib/camos-gateway"
 	gatewayIdentityPath      = gatewayIdentityDirectory + "/GatewayID"
 )
 

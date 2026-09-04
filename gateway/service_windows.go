@@ -20,6 +20,11 @@ const (
 	serviceExitJobConfiguration     = 3
 	serviceExitJobAssignment        = 4
 	serviceExitControllerStopped    = 5
+	serviceExitEmbeddedPayload      = 6
+	serviceExitRuntimeIdentity      = 7
+	serviceExitRestartRequested     = 8
+	serviceExitUpdateRequested      = 9
+	serviceExitRemovalRequested     = 10
 )
 
 type camOSWindowsService struct {
@@ -40,11 +45,6 @@ func (service *camOSWindowsService) Execute(
 		WaitHint: 30_000,
 	}
 
-	gatewayID, err := loadGatewayID()
-	if err != nil {
-		return true, serviceExitGatewayIDUnavailable
-	}
-
 	processJob, exitCode := createProcessLifetimeJob()
 	if exitCode != 0 {
 		return true, exitCode
@@ -54,12 +54,31 @@ func (service *camOSWindowsService) Execute(
 	// terminate the service itself together with any remaining FFmpeg children.
 	service.processJob = processJob
 
+	removalPending, err := gatewayRemovalPending()
+	if err != nil {
+		return true, serviceExitRuntimeIdentity
+	}
+	if removalPending {
+		if err := beginGatewayRemoval(); err != nil {
+			return true, serviceExitRemovalRequested
+		}
+		return true, serviceExitRemovalRequested
+	}
+	ffmpegPath, err := installedFFmpegPath()
+	if err != nil || ensureEmbeddedFFmpeg(ffmpegPath) != nil {
+		return true, serviceExitEmbeddedPayload
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
+	credentials, err := newRuntimeCredentials(ctx)
+	if err != nil {
+		cancel()
+		return true, serviceExitRuntimeIdentity
+	}
 	resume := make(chan struct{}, 1)
-	controllerDone := make(chan struct{})
+	controllerDone := make(chan controllerExit, 1)
 	go func() {
-		runController(ctx, gatewayID, resume)
-		close(controllerDone)
+		controllerDone <- runController(ctx, credentials, resume)
 	}()
 
 	runningStatus := svc.Status{
@@ -93,9 +112,18 @@ func (service *camOSWindowsService) Execute(
 				return false, 0
 			}
 
-		case <-controllerDone:
+		case exit := <-controllerDone:
 			cancel()
-			return true, serviceExitControllerStopped
+			switch exit {
+			case controllerExitRestarted:
+				return true, serviceExitRestartRequested
+			case controllerExitUpdated:
+				return true, serviceExitUpdateRequested
+			case controllerExitRemoved:
+				return true, serviceExitRemovalRequested
+			default:
+				return true, serviceExitControllerStopped
+			}
 		}
 	}
 }
@@ -107,7 +135,9 @@ func createProcessLifetimeJob() (windows.Handle, uint32) {
 	}
 
 	information := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
-	information.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	information.BasicLimitInformation.LimitFlags =
+		windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+			windows.JOB_OBJECT_LIMIT_BREAKAWAY_OK
 	if _, err := windows.SetInformationJobObject(
 		job,
 		windows.JobObjectExtendedLimitInformation,
