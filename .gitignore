@@ -1,3 +1,6 @@
 main
 *.zip
-gateway/sa.json
+gateway/bootstrap_sa.json
+gateway/ffmpeg
+gateway/ffmpeg.exe
+gateway/dist/

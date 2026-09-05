@@ -5,8 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/url"
-	"strings"
+	"strconv"
 	"sync"
 	"time"
 
@@ -14,7 +13,10 @@ import (
 	"google.golang.org/api/googleapi"
 )
 
-const objectTimeLayout = "2006-01-02T15-04-05.000000Z.jpg"
+const (
+	gcsBucketName    = "camos-prod-0"
+	objectTimeLayout = "2006-01-02T15-04-05.000Z.jpg"
+)
 
 type acceptedImage struct {
 	version    uint64
@@ -136,11 +138,9 @@ func uploadDeviceImages(
 	client *storage.Client,
 	runtime *deviceRuntime,
 ) {
-	var uncertainVersion uint64
 	for {
 		image, ok := runtime.images.snapshot()
 		if !ok {
-			uncertainVersion = 0
 			select {
 			case <-ctx.Done():
 				return
@@ -148,49 +148,16 @@ func uploadDeviceImages(
 				continue
 			}
 		}
-		if uncertainVersion != 0 && uncertainVersion != image.version {
-			uncertainVersion = 0
-		}
-
-		if uncertainVersion != 0 && uncertainVersion == image.version {
-			confirmedAt, exists, err := confirmAcceptedImage(
-				ctx,
-				client,
-				runtime.config.gcsURI,
-				image,
-			)
-			if err != nil {
-				if !waitContext(ctx, retryDelay) {
-					return
-				}
-				continue
-			}
-			if exists {
-				runtime.facts.observeUpload(confirmedAt)
-				runtime.images.clear(image.version)
-				uncertainVersion = 0
-				continue
-			}
-			uncertainVersion = 0
-			continue
-		}
-
-		completedAt, ambiguous, err := uploadAcceptedImage(
+		completedAt, err := uploadAcceptedImage(
 			ctx,
 			client,
-			runtime.config.gcsURI,
+			runtime.config,
 			image,
 		)
 		if err == nil {
 			runtime.facts.observeUpload(completedAt)
 			runtime.images.clear(image.version)
-			uncertainVersion = 0
 			continue
-		}
-		if ambiguous {
-			uncertainVersion = image.version
-		} else {
-			uncertainVersion = 0
 		}
 		if !waitContext(ctx, retryDelay) {
 			return
@@ -201,16 +168,13 @@ func uploadDeviceImages(
 func uploadAcceptedImage(
 	ctx context.Context,
 	client *storage.Client,
-	gcsURI string,
+	device deviceRecord,
 	image acceptedImage,
-) (time.Time, bool, error) {
+) (time.Time, error) {
 	operationCtx, cancel := context.WithTimeout(ctx, cloudOperationTimeout)
 	defer cancel()
 
-	object, err := acceptedImageObject(client, gcsURI, image.capturedAt)
-	if err != nil {
-		return time.Time{}, false, err
-	}
+	object := acceptedImageObject(client, device, image.capturedAt)
 	writer := object.If(storage.Conditions{DoesNotExist: true}).NewWriter(operationCtx)
 	writer.ContentType = "image/jpeg"
 	writer.ChunkSize = 0
@@ -218,85 +182,55 @@ func uploadAcceptedImage(
 	written, writeErr := writer.Write(image.jpegBytes)
 	if writeErr != nil {
 		_ = writer.CloseWithError(writeErr)
-		cancel()
-		closeErr := writer.Close()
-		ambiguous := isPreconditionFailed(writeErr) ||
-			isPreconditionFailed(closeErr) ||
-			written == len(image.jpegBytes)
-		return time.Time{}, ambiguous, writeErr
+		if isPreconditionFailed(writeErr) {
+			return time.Now().UTC(), nil
+		}
+		return time.Time{}, writeErr
 	}
 	if written != len(image.jpegBytes) {
 		_ = writer.CloseWithError(io.ErrShortWrite)
-		cancel()
-		_ = writer.Close()
-		return time.Time{}, false, io.ErrShortWrite
+		return time.Time{}, io.ErrShortWrite
 	}
 	if err := writer.Close(); err != nil {
-		return time.Time{}, uploadCompletionMayBeAmbiguous(err), err
+		if isPreconditionFailed(err) {
+			return time.Now().UTC(), nil
+		}
+		return time.Time{}, err
 	}
-	return time.Now().UTC(), false, nil
-}
-
-func confirmAcceptedImage(
-	ctx context.Context,
-	client *storage.Client,
-	gcsURI string,
-	image acceptedImage,
-) (time.Time, bool, error) {
-	operationCtx, cancel := context.WithTimeout(ctx, cloudOperationTimeout)
-	defer cancel()
-
-	object, err := acceptedImageObject(client, gcsURI, image.capturedAt)
-	if err != nil {
-		return time.Time{}, false, err
-	}
-	attributes, err := object.Attrs(operationCtx)
-	if errors.Is(err, storage.ErrObjectNotExist) {
-		return time.Time{}, false, nil
-	}
-	if err != nil {
-		return time.Time{}, false, err
-	}
-	return attributes.Updated.UTC(), true, nil
+	return time.Now().UTC(), nil
 }
 
 func acceptedImageObject(
 	client *storage.Client,
-	gcsURI string,
+	device deviceRecord,
 	capturedAt time.Time,
-) (*storage.ObjectHandle, error) {
-	destination, err := url.Parse(strings.TrimSpace(gcsURI))
-	if err != nil {
-		return nil, err
-	}
-	prefix := strings.Trim(destination.Path, "/")
+) *storage.ObjectHandle {
 	return client.
-		Bucket(destination.Host).
-		Object(objectName(prefix, capturedAt)).
-		Retryer(storage.WithPolicy(storage.RetryNever)), nil
+		Bucket(gcsBucketName).
+		Object(objectName(
+			device.organisationID,
+			device.siteID,
+			device.id,
+			capturedAt,
+		)).
+		Retryer(storage.WithPolicy(storage.RetryNever))
 }
 
-func objectName(prefix string, timestamp time.Time) string {
-	filename := timestamp.Format(objectTimeLayout)
-	if prefix == "" {
-		return filename
-	}
-	return prefix + "/" + filename
+func objectName(
+	organisationID int64,
+	siteID int64,
+	deviceID int64,
+	timestamp time.Time,
+) string {
+	return strconv.FormatInt(organisationID, 10) + "/" +
+		strconv.FormatInt(siteID, 10) + "/" +
+		strconv.FormatInt(deviceID, 10) + "/" +
+		timestamp.UTC().Format(objectTimeLayout)
 }
 
 func isPreconditionFailed(err error) bool {
 	var apiErr *googleapi.Error
 	return errors.As(err, &apiErr) && apiErr.Code == http.StatusPreconditionFailed
-}
-
-func uploadCompletionMayBeAmbiguous(err error) bool {
-	var apiErr *googleapi.Error
-	if !errors.As(err, &apiErr) {
-		return true
-	}
-	return apiErr.Code == http.StatusRequestTimeout ||
-		apiErr.Code == http.StatusPreconditionFailed ||
-		apiErr.Code >= http.StatusInternalServerError
 }
 
 func superviseRuntimeFacts(

@@ -15,7 +15,7 @@ func TestCopyWindowsPackageFileIfAbsent(t *testing.T) {
 	if err := os.WriteFile(source, []byte("first"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := copyWindowsPackageFileIfAbsent(source, target, 0o600, false); err != nil {
+	if err := copyWindowsPackageFileIfAbsent(source, target, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	assertFileContents(t, target, "first")
@@ -23,7 +23,7 @@ func TestCopyWindowsPackageFileIfAbsent(t *testing.T) {
 	if err := os.WriteFile(source, []byte("replacement"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := copyWindowsPackageFileIfAbsent(source, target, 0o600, false); err != nil {
+	if err := copyWindowsPackageFileIfAbsent(source, target, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	assertFileContents(t, target, "first")
@@ -40,7 +40,7 @@ func TestCopyWindowsPackageFileRecoversInterruptedFirstInstall(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := copyWindowsPackageFileIfAbsent(source, target, 0o600, false); err != nil {
+	if err := copyWindowsPackageFileIfAbsent(source, target, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	assertFileContents(t, target, "complete")

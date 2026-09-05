@@ -1,10 +1,9 @@
-//go:build darwin
+//go:build linux
 
 package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -15,6 +14,7 @@ const ffmpegExecutableName = "ffmpeg"
 func runService() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
 	pending, err := gatewayRemovalPending()
 	if err != nil {
 		return err
@@ -35,12 +35,6 @@ func runService() error {
 	}
 
 	resume := make(chan struct{}, 1)
-	powerWatcher, err := startPowerResumeWatcher(resume)
-	if err != nil {
-		return fmt.Errorf("power notification registration failed: %w", err)
-	}
-	defer powerWatcher.stop()
-
 	runController(ctx, credentials, resume)
 	return nil
 }

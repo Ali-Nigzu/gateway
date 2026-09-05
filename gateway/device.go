@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"image"
 	"image/jpeg"
 	"net/url"
@@ -58,46 +57,45 @@ func runDeviceAttemptSafely(ctx context.Context, runtime *deviceRuntime) {
 }
 
 func (runtime *deviceRuntime) runDeviceAttempt(ctx context.Context) error {
-	var source struct {
-		URI      string `json:"uri"`
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if err := json.Unmarshal(runtime.config.rtspConfig, &source); err != nil {
-		return err
-	}
-	var capture struct {
-		FPS       int     `json:"fps"`
-		Threshold float64 `json:"change_threshold_percent"`
-	}
-	if err := json.Unmarshal(runtime.config.captureConfig, &capture); err != nil {
-		return err
-	}
-
-	sourceURL, err := url.Parse(strings.TrimSpace(source.URI))
+	sourceURI, err := deviceSourceURI(runtime.config)
 	if err != nil {
 		return err
-	}
-	if source.Username != "" || source.Password != "" {
-		if source.Password == "" {
-			sourceURL.User = url.User(source.Username)
-		} else {
-			sourceURL.User = url.UserPassword(source.Username, source.Password)
-		}
 	}
 
 	connected := false
 	return streamRTSP(
 		ctx,
-		sourceURL.String(),
-		capture.FPS,
+		sourceURI,
+		runtime.config.captureFPS,
 		runtime.rawFrame,
 		func(rgb []byte, observedAt time.Time) error {
 			runtime.facts.observeFrame(observedAt, !connected)
 			connected = true
-			return runtime.processFrame(rgb, observedAt, capture.Threshold)
+			return runtime.processFrame(
+				rgb,
+				observedAt,
+				runtime.config.changeThresholdPercent,
+			)
 		},
 	)
+}
+
+func deviceSourceURI(config deviceRecord) (string, error) {
+	sourceURL, err := url.Parse(strings.TrimSpace(config.rtspURI))
+	if err != nil {
+		return "", err
+	}
+	if config.rtspUsername != "" || config.rtspPassword != "" {
+		if config.rtspPassword == "" {
+			sourceURL.User = url.User(config.rtspUsername)
+		} else {
+			sourceURL.User = url.UserPassword(
+				config.rtspUsername,
+				config.rtspPassword,
+			)
+		}
+	}
+	return sourceURL.String(), nil
 }
 
 func (runtime *deviceRuntime) processFrame(

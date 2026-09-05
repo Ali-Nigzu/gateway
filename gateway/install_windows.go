@@ -12,7 +12,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
@@ -34,21 +33,19 @@ const (
 )
 
 type windowsPackagePaths struct {
-	directory   string
-	executable  string
-	ffmpeg      string
-	credentials string
+	directory  string
+	executable string
+	ffmpeg     string
 }
 
-func installService(gatewayID uuid.UUID) error {
+func installService() error {
+	if err := validateEmbeddedRelease(); err != nil {
+		return err
+	}
 	paths, err := resolveWindowsPackagePaths()
 	if err != nil {
 		return err
 	}
-	if err := secureWindowsCredentialsIfPresent(paths.credentials); err != nil {
-		return err
-	}
-
 	manager, err := mgr.Connect()
 	if err != nil {
 		return fmt.Errorf("Service Control Manager unavailable: %w", err)
@@ -57,32 +54,25 @@ func installService(gatewayID uuid.UUID) error {
 
 	service, err := manager.OpenService(windowsServiceName)
 	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-		return installFirstWindowsService(manager, paths, gatewayID)
+		return installFirstWindowsService(manager, paths)
 	}
 	if err != nil {
 		return fmt.Errorf("Gateway service inspection failed: %w", err)
 	}
 	defer service.Close()
 
-	identitySame, err := storedGatewayIDMatches(gatewayID)
-	if err != nil {
-		return err
-	}
 	currentConfig, err := service.Config()
 	if err != nil {
 		return fmt.Errorf("Gateway service configuration read failed: %w", err)
 	}
 	expectedConfig := windowsServiceConfig(paths.executable)
 
-	if !identitySame || serviceRuntimeConfigurationChanged(currentConfig, expectedConfig) {
+	if serviceRuntimeConfigurationChanged(currentConfig, expectedConfig) {
 		if err := stopWindowsService(service); err != nil {
 			return err
 		}
 	}
 
-	if err := saveGatewayID(gatewayID); err != nil {
-		return err
-	}
 	if !windowsServiceConfigurationMatches(currentConfig, expectedConfig) {
 		if err := service.UpdateConfig(expectedConfig); err != nil {
 			return fmt.Errorf("Gateway service configuration failed: %w", err)
@@ -102,15 +92,10 @@ func installService(gatewayID uuid.UUID) error {
 func installFirstWindowsService(
 	manager *mgr.Mgr,
 	paths windowsPackagePaths,
-	gatewayID uuid.UUID,
 ) error {
 	if err := installWindowsPackageIfAbsent(paths); err != nil {
 		return err
 	}
-	if err := saveGatewayID(gatewayID); err != nil {
-		return err
-	}
-
 	config := windowsServiceConfig(paths.executable)
 	service, err := manager.CreateService(
 		windowsServiceName,
@@ -139,10 +124,9 @@ func resolveWindowsPackagePaths() (windowsPackagePaths, error) {
 	}
 	directory := filepath.Join(programFiles, gatewayInstallDirectoryName)
 	return windowsPackagePaths{
-		directory:   directory,
-		executable:  filepath.Join(directory, gatewayExecutableFilename),
-		ffmpeg:      filepath.Join(directory, gatewayFFmpegFilename),
-		credentials: filepath.Join(directory, serviceAccountFilename),
+		directory:  directory,
+		executable: filepath.Join(directory, gatewayExecutableFilename),
+		ffmpeg:     filepath.Join(directory, gatewayFFmpegFilename),
 	}, nil
 }
 
@@ -155,25 +139,12 @@ func installWindowsPackageIfAbsent(paths windowsPackagePaths) error {
 	if err != nil {
 		return fmt.Errorf("Gateway executable path unavailable: %w", err)
 	}
-	sourceDirectory := filepath.Dir(executablePath)
 	packageFiles := []struct {
-		source      string
-		target      string
-		mode        os.FileMode
-		credentials bool
+		source string
+		target string
+		mode   os.FileMode
 	}{
 		{source: executablePath, target: paths.executable, mode: 0o755},
-		{
-			source: filepath.Join(sourceDirectory, gatewayFFmpegFilename),
-			target: paths.ffmpeg,
-			mode:   0o755,
-		},
-		{
-			source:      filepath.Join(sourceDirectory, serviceAccountFilename),
-			target:      paths.credentials,
-			mode:        0o600,
-			credentials: true,
-		},
 	}
 
 	for _, packageFile := range packageFiles {
@@ -181,19 +152,17 @@ func installWindowsPackageIfAbsent(paths windowsPackagePaths) error {
 			packageFile.source,
 			packageFile.target,
 			packageFile.mode,
-			packageFile.credentials,
 		); err != nil {
 			return err
 		}
 	}
-	return secureWindowsCredentialsIfPresent(paths.credentials)
+	return ensureEmbeddedFFmpeg(paths.ffmpeg)
 }
 
 func copyWindowsPackageFileIfAbsent(
 	sourcePath string,
 	targetPath string,
 	mode os.FileMode,
-	credentials bool,
 ) error {
 	targetInfo, err := os.Lstat(targetPath)
 	if err == nil {
@@ -226,11 +195,6 @@ func copyWindowsPackageFileIfAbsent(
 		os.Remove(temporaryPath)
 	}()
 
-	if credentials {
-		if err := applyWindowsCredentialDACL(temporaryPath); err != nil {
-			return err
-		}
-	}
 	if _, err := io.Copy(temporary, source); err != nil {
 		return fmt.Errorf("package installation failed for %s: %w", targetPath, err)
 	}
@@ -253,9 +217,6 @@ func copyWindowsPackageFileIfAbsent(
 		}
 		return fmt.Errorf("package publication failed for %s: %w", targetPath, err)
 	}
-	if credentials {
-		return applyWindowsCredentialDACL(targetPath)
-	}
 	return nil
 }
 
@@ -276,69 +237,6 @@ func moveWindowsPackageFileWithoutReplacement(sourcePath, targetPath string) err
 		return err
 	}
 	return windows.MoveFile(source, target)
-}
-
-func secureWindowsCredentialsIfPresent(path string) error {
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("Gateway credentials inspection failed: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("Gateway credentials path is not a regular file: %s", path)
-	}
-	return applyWindowsCredentialDACL(path)
-}
-
-func applyWindowsCredentialDACL(path string) error {
-	systemSID, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
-	if err != nil {
-		return fmt.Errorf("Gateway credentials LocalSystem SID creation failed: %w", err)
-	}
-	administratorsSID, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
-	if err != nil {
-		return fmt.Errorf("Gateway credentials Administrators SID creation failed: %w", err)
-	}
-	access := []windows.EXPLICIT_ACCESS{
-		{
-			AccessPermissions: windows.GENERIC_ALL,
-			AccessMode:        windows.GRANT_ACCESS,
-			Inheritance:       windows.NO_INHERITANCE,
-			Trustee: windows.TRUSTEE{
-				TrusteeForm:  windows.TRUSTEE_IS_SID,
-				TrusteeType:  windows.TRUSTEE_IS_USER,
-				TrusteeValue: windows.TrusteeValueFromSID(systemSID),
-			},
-		},
-		{
-			AccessPermissions: windows.GENERIC_ALL,
-			AccessMode:        windows.GRANT_ACCESS,
-			Inheritance:       windows.NO_INHERITANCE,
-			Trustee: windows.TRUSTEE{
-				TrusteeForm:  windows.TRUSTEE_IS_SID,
-				TrusteeType:  windows.TRUSTEE_IS_GROUP,
-				TrusteeValue: windows.TrusteeValueFromSID(administratorsSID),
-			},
-		},
-	}
-	dacl, err := windows.ACLFromEntries(access, nil)
-	if err != nil {
-		return fmt.Errorf("Gateway credentials DACL creation failed: %w", err)
-	}
-	if err := windows.SetNamedSecurityInfo(
-		path,
-		windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		nil,
-		nil,
-		dacl,
-		nil,
-	); err != nil {
-		return fmt.Errorf("Gateway credentials permissions failed: %w", err)
-	}
-	return nil
 }
 
 func windowsServiceConfig(executablePath string) mgr.Config {
@@ -407,7 +305,7 @@ func configureWindowsServiceRecovery(service *mgr.Service) error {
 	if err := service.SetRecoveryActions(actions, recoveryResetPeriod); err != nil {
 		return fmt.Errorf("Gateway service crash recovery configuration failed: %w", err)
 	}
-	if err := service.SetRecoveryActionsOnNonCrashFailures(false); err != nil {
+	if err := service.SetRecoveryActionsOnNonCrashFailures(true); err != nil {
 		return fmt.Errorf("Gateway service crash recovery policy failed: %w", err)
 	}
 	return nil
