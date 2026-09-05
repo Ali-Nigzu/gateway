@@ -108,8 +108,9 @@ func runLinuxRemovalHelper() error {
 	if err != nil {
 		return err
 	}
-	if err := removeExactDirectory(paths.directory, "/var/lib/camos-gateway"); err != nil {
-		return fmt.Errorf("Gateway identity removal failed: %w", err)
+	helperPath := filepath.Join(paths.workDirectory, linuxRemovalHelperName)
+	if err := prepareIdentityForFinalRemoval(paths, helperPath); err != nil {
+		return err
 	}
 	if err := runSystemctl("disable", systemdRemovalUnitName); err != nil {
 		return fmt.Errorf("removal systemd unit disable failed: %w", err)
@@ -126,5 +127,6 @@ func runLinuxRemovalHelper() error {
 	if err := runSystemctl("daemon-reload"); err != nil {
 		return fmt.Errorf("final systemd reload failed: %w", err)
 	}
-	return nil
+	// The helper and terminal marker are the final application files removed.
+	return removeExactDirectory(paths.directory, "/var/lib/camos-gateway")
 }

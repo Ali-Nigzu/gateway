@@ -66,10 +66,19 @@ func TestDownloadGatewayCandidateVerifiesMetadataHash(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch {
 		case request.URL.Path == "/v1/"+artifactRegistryRepository+"/files":
-			fmt.Fprintf(writer, `{"files":[{"name":%q,"sizeBytes":%q,"owner":%q,"hashes":[{"type":"SHA256","value":%q}]}]}`,
+			if request.URL.Query().Get("filter") != fmt.Sprintf("owner=\"%s\"", owner) ||
+				request.URL.Query().Get("pageSize") != "1000" {
+				t.Errorf("unexpected metadata query: %s", request.URL.RawQuery)
+			}
+			// The approved metadata SHA remains authoritative even when the
+			// optional JSON size field is absent.
+			fmt.Fprintf(writer, `{"files":[{"name":%q,"owner":%q,"hashes":[{"type":"SHA256","value":%q}]}]}`,
 				artifactRegistryRepository+"/files/"+filename,
-				fmt.Sprint(len(payload)), owner, base64.StdEncoding.EncodeToString(digest[:]))
+				owner, base64.StdEncoding.EncodeToString(digest[:]))
 		case request.URL.Path == "/download/v1/"+artifactRegistryRepository+"/files/"+filename+":download":
+			if request.URL.Query().Get("alt") != "media" {
+				t.Errorf("download alt = %q, want media", request.URL.Query().Get("alt"))
+			}
 			_, _ = writer.Write(payload)
 		default:
 			http.NotFound(writer, request)
@@ -87,6 +96,20 @@ func TestDownloadGatewayCandidateVerifiesMetadataHash(t *testing.T) {
 	actual, err := os.ReadFile(candidate)
 	if err != nil || string(actual) != string(payload) {
 		t.Fatalf("candidate = %q, %v", actual, err)
+	}
+}
+
+func TestArtifactExpectedSizeIsOptionalButBounded(t *testing.T) {
+	if _, known, err := artifactExpectedSize(""); err != nil || known {
+		t.Fatalf("missing optional size = known %t, error %v", known, err)
+	}
+	if size, known, err := artifactExpectedSize("123"); err != nil || !known || size != 123 {
+		t.Fatalf("valid size = %d, known %t, error %v", size, known, err)
+	}
+	for _, invalid := range []string{"0", "-1", "invalid", fmt.Sprint(maximumGatewayArtifactSize + 1)} {
+		if _, _, err := artifactExpectedSize(invalid); err == nil {
+			t.Fatalf("invalid artifact size %q was accepted", invalid)
+		}
 	}
 }
 

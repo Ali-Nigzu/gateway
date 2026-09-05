@@ -149,15 +149,20 @@ func TestCertificateConfigurationUsesOnlyAbsoluteKeyAndCertificatePaths(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	var decoded map[string]any
+	var decoded struct {
+		CertConfigs struct {
+			Workload struct {
+				CertificatePath string `json:"cert_path"`
+				PrivateKeyPath  string `json:"key_path"`
+			} `json:"workload"`
+		} `json:"cert_configs"`
+	}
 	if err := json.Unmarshal(encoded, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if len(decoded) != 1 || decoded["cert_configs"] == nil {
-		t.Fatalf("unexpected certificate configuration: %s", encoded)
-	}
-	text := string(encoded)
-	if !strings.Contains(text, certificatePath) || !strings.Contains(text, privateKeyPath) || strings.Contains(text, "token") {
+	if decoded.CertConfigs.Workload.CertificatePath != certificatePath ||
+		decoded.CertConfigs.Workload.PrivateKeyPath != privateKeyPath ||
+		strings.Contains(string(encoded), "token") {
 		t.Fatalf("certificate configuration has the wrong contents: %s", encoded)
 	}
 	if _, err := marshalCertificateConfig("relative.pem", privateKeyPath); err == nil {

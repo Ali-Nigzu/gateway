@@ -305,7 +305,7 @@ func configureWindowsServiceRecovery(service *mgr.Service) error {
 	if err := service.SetRecoveryActions(actions, recoveryResetPeriod); err != nil {
 		return fmt.Errorf("Gateway service crash recovery configuration failed: %w", err)
 	}
-	if err := service.SetRecoveryActionsOnNonCrashFailures(false); err != nil {
+	if err := service.SetRecoveryActionsOnNonCrashFailures(true); err != nil {
 		return fmt.Errorf("Gateway service crash recovery policy failed: %w", err)
 	}
 	return nil

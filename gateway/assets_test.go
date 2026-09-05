@@ -16,7 +16,13 @@ func TestValidateEmbeddedReleaseRequiresBothAssets(t *testing.T) {
 	if err := validateEmbeddedRelease(); err == nil {
 		t.Fatal("missing assets were accepted")
 	}
-	embeddedBootstrapCredential = []byte("bootstrap")
+	embeddedBootstrapCredential = []byte(`{
+        "type":"service_account",
+        "project_id":"camosbase",
+        "client_email":"gateway-bootstrap@camosbase.iam.gserviceaccount.com",
+        "private_key":"private material",
+        "token_uri":"https://oauth2.googleapis.com/token"
+    }`)
 	if err := validateEmbeddedRelease(); err == nil {
 		t.Fatal("missing FFmpeg was accepted")
 	}
@@ -46,5 +52,11 @@ func TestEnsureEmbeddedFFmpegReplacesDifferentPayload(t *testing.T) {
 	}
 	if _, err := os.Stat(path + ".installing"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("temporary file remains: %v", err)
+	}
+}
+
+func TestHashFileRejectsNonRegularPaths(t *testing.T) {
+	if _, err := hashFile(t.TempDir()); err == nil {
+		t.Fatal("directory was accepted as an embedded payload target")
 	}
 }

@@ -61,6 +61,9 @@ func commission(rawCommissionID string) error {
 	if rawCommissionID == "" || strings.TrimSpace(rawCommissionID) == "" {
 		return errors.New("Commission ID must not be empty")
 	}
+	if err := validateEmbeddedRelease(); err != nil {
+		return err
+	}
 
 	prepared, err := prepareCommission(rawCommissionID, time.Now())
 	if err != nil {
@@ -108,6 +111,16 @@ func commission(rawCommissionID string) error {
 		}
 		if err := saveGatewayCertificate(prepared.paths, certificatePEM); err != nil {
 			return errors.New("Gateway certificate persistence failed")
+		}
+		if err := ensureCertificateConfig(prepared.paths); err != nil {
+			return err
+		}
+		// Prove the issued identity through X.509 WIF before making GatewayID
+		// the final commit marker. A bad or unusable certificate therefore
+		// remains a resumable commissioning attempt instead of permanently
+		// committing an appliance that cannot authenticate.
+		if err := proveRuntimeIdentity(ctx, gatewayID, prepared.paths.certificateConfig); err != nil {
+			return err
 		}
 		// GatewayID is deliberately the final durable identity commit marker.
 		if err := saveGatewayID(gatewayID); err != nil {

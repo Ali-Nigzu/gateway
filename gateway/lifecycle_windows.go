@@ -102,12 +102,6 @@ func beginGatewayRemoval() error {
 	if err != nil {
 		return err
 	}
-	active, err := installedExecutablePath()
-	if err != nil {
-		return err
-	}
-	_ = scheduleWindowsDeletion(active)
-	_ = scheduleWindowsDeletion(helper)
 	return launchWindowsLifecycleHelper(helper, windowsInternalRemoveCommand)
 }
 
@@ -286,7 +280,7 @@ func startWindowsGatewayService() error {
 	return ensureWindowsServiceRunning(service)
 }
 
-func runWindowsRemovalHelper() error {
+func runWindowsRemovalHelper() (resultErr error) {
 	pending, err := gatewayRemovalPending()
 	if err != nil {
 		return err
@@ -298,32 +292,151 @@ func runWindowsRemovalHelper() error {
 	if err != nil {
 		return errors.New("Service Control Manager unavailable")
 	}
+	managerOpen := true
+	var service *mgr.Service
+	restartOnFailure := false
+	defer func() {
+		if service != nil {
+			service.Close()
+		}
+		if managerOpen {
+			manager.Disconnect()
+		}
+		if resultErr != nil && restartOnFailure {
+			_ = startWindowsGatewayService()
+		}
+	}()
 	service, openErr := manager.OpenService(windowsServiceName)
 	if openErr == nil {
+		restartOnFailure = true
 		if err := stopWindowsService(service); err != nil {
-			service.Close()
-			manager.Disconnect()
 			return err
 		}
-		if err := service.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
-			service.Close()
-			manager.Disconnect()
-			return errors.New("Gateway service removal failed")
-		}
-		service.Close()
 	} else if !errors.Is(openErr, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-		manager.Disconnect()
 		return errors.New("Gateway service inspection failed")
 	}
-	manager.Disconnect()
 
-	if err := removeWindowsInstalledPackage(); err != nil {
+	active, err := installedExecutablePath()
+	if err != nil {
+		return err
+	}
+	helper, err := os.Executable()
+	if err != nil {
+		return errors.New("removal helper path unavailable")
+	}
+	if err := removeWindowsInstalledPackageExcept(active); err != nil {
 		return err
 	}
 	if err := deleteGatewayID(); err != nil {
 		return err
 	}
+	if err := removeWindowsIdentityExceptRemovalState(helper); err != nil {
+		return err
+	}
+
+	if service != nil {
+		if err := service.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
+			return errors.New("Gateway service removal failed")
+		}
+		service.Close()
+		service = nil
+	}
+	manager.Disconnect()
+	managerOpen = false
+	restartOnFailure = false
+
+	// Register exact file/directory fallbacks only after the SCM definition is
+	// gone. Before that point, any interruption leaves the automatic service,
+	// active executable, durable marker and helper able to resume removal.
+	scheduleWindowsFinalRemoval(active, helper)
+
+	if err := removeWindowsInstalledPackage(); err != nil {
+		return err
+	}
 	return removeWindowsIdentityState()
+}
+
+func removeWindowsInstalledPackageExcept(activeExecutable string) error {
+	paths, err := resolveWindowsPackagePaths()
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(paths.directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return errors.New("Gateway installation inspection failed")
+	}
+	for _, entry := range entries {
+		path := filepath.Join(paths.directory, entry.Name())
+		if sameWindowsPath(path, activeExecutable) {
+			continue
+		}
+		if err := os.RemoveAll(path); err != nil {
+			return errors.New("Gateway installation preparation failed")
+		}
+	}
+	return nil
+}
+
+func removeWindowsIdentityExceptRemovalState(helperExecutable string) error {
+	paths, err := resolveIdentityPaths()
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(paths.directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return errors.New("Gateway identity inspection failed")
+	}
+	for _, entry := range entries {
+		path := filepath.Join(paths.directory, entry.Name())
+		if sameWindowsPath(path, paths.removalPending) ||
+			sameWindowsPath(path, paths.workDirectory) {
+			continue
+		}
+		if err := os.RemoveAll(path); err != nil {
+			return errors.New("Gateway identity preparation failed")
+		}
+	}
+	workEntries, err := os.ReadDir(paths.workDirectory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return errors.New("Gateway lifecycle state inspection failed")
+	}
+	for _, entry := range workEntries {
+		path := filepath.Join(paths.workDirectory, entry.Name())
+		if sameWindowsPath(path, helperExecutable) {
+			continue
+		}
+		if err := os.RemoveAll(path); err != nil {
+			return errors.New("Gateway lifecycle state preparation failed")
+		}
+	}
+	return nil
+}
+
+func scheduleWindowsFinalRemoval(activeExecutable, helperExecutable string) {
+	packagePaths, packageErr := resolveWindowsPackagePaths()
+	identityPaths, identityErr := resolveIdentityPaths()
+	if packageErr != nil || identityErr != nil {
+		return
+	}
+	for _, path := range []string{
+		activeExecutable,
+		packagePaths.directory,
+		identityPaths.removalPending,
+		helperExecutable,
+		identityPaths.workDirectory,
+		identityPaths.directory,
+	} {
+		_ = scheduleWindowsDeletion(path)
+	}
 }
 
 func removeWindowsInstalledPackage() error {

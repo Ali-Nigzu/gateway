@@ -222,6 +222,31 @@ func newWIFCredentials(
 	))
 }
 
+func proveRuntimeIdentity(
+	ctx context.Context,
+	gatewayID uuid.UUID,
+	certificateConfigPath string,
+) error {
+	if gatewayID == uuid.Nil {
+		return errors.New("runtime identity is invalid")
+	}
+	credentials, err := newWIFCredentials(
+		certificateConfigPath,
+		runtimeCloudScopes,
+		true,
+		&http.Client{Timeout: authHTTPTimeout},
+	)
+	if err != nil {
+		return errors.New("runtime identity authentication failed")
+	}
+	operationCtx, cancel := context.WithTimeout(ctx, authHTTPTimeout)
+	defer cancel()
+	if _, err := credentials.Token(operationCtx); err != nil {
+		return errors.New("runtime identity authentication failed")
+	}
+	return nil
+}
+
 func reusableOAuth2TokenSource(credentials *auth.Credentials) oauth2.TokenSource {
 	return oauth2.ReuseTokenSource(
 		nil,

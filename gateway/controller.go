@@ -148,6 +148,18 @@ func runControllerCycle(
 ) (controllerExit, bool) {
 	control, fresh := pollGatewayControl(ctx, credentials, store)
 	if !fresh {
+		// A failed DB read can never authorize terminal removal, but renewal is
+		// independent of Postgres and must keep progressing through a long DB
+		// outage so the appliance does not strand itself with an expired cert.
+		if exit, finished := reconcileCertificateLifecycle(
+			ctx,
+			credentials,
+			engine,
+			lastRenewalAttempt,
+			restartAfterRenewal,
+		); finished {
+			return exit, true
+		}
 		if forceRestart && *haveControl && *haveDevices {
 			reconcileEngine(ctx, credentials, *lastControl, *lastDevices, true, engine)
 		}
@@ -183,31 +195,14 @@ func runControllerCycle(
 		}
 	}
 
-	if *restartAfterRenewal {
-		stopEngine(engine)
-		if err := beginGatewayRestart(); err == nil {
-			return controllerExitRestarted, true
-		}
-		return controllerExitStopped, false
-	}
-
-	now := time.Now().UTC()
-	if lastRenewalAttempt.IsZero() || now.Sub(*lastRenewalAttempt) >= certificateRenewalRetryInterval {
-		identity, err := loadGatewayIdentity(now)
-		if err == nil && gatewayCertificateNeedsRenewal(identity.certificate, now) {
-			*lastRenewalAttempt = now
-			operationCtx, cancel := context.WithTimeout(ctx, cloudOperationTimeout)
-			renewed, renewalErr := renewGatewayCertificate(operationCtx, credentials, now)
-			cancel()
-			if renewalErr == nil && renewed {
-				*restartAfterRenewal = true
-				stopEngine(engine)
-				if err := beginGatewayRestart(); err == nil {
-					return controllerExitRestarted, true
-				}
-				return controllerExitStopped, false
-			}
-		}
+	if exit, finished := reconcileCertificateLifecycle(
+		ctx,
+		credentials,
+		engine,
+		lastRenewalAttempt,
+		restartAfterRenewal,
+	); finished {
+		return exit, true
 	}
 
 	if !gatewayControlRunsCamera(control) {
@@ -231,6 +226,46 @@ func runControllerCycle(
 	*lastDevices = slices.Clone(devices)
 	*haveDevices = true
 	reconcileEngine(ctx, credentials, control, devices, forceRestart, engine)
+	return controllerExitStopped, false
+}
+
+func reconcileCertificateLifecycle(
+	ctx context.Context,
+	credentials *runtimeCredentials,
+	engine **activeEngine,
+	lastRenewalAttempt *time.Time,
+	restartAfterRenewal *bool,
+) (controllerExit, bool) {
+	if *restartAfterRenewal {
+		stopEngine(engine)
+		if err := beginGatewayRestart(); err == nil {
+			return controllerExitRestarted, true
+		}
+		return controllerExitStopped, false
+	}
+
+	now := time.Now().UTC()
+	if !lastRenewalAttempt.IsZero() && now.Sub(*lastRenewalAttempt) < certificateRenewalRetryInterval {
+		return controllerExitStopped, false
+	}
+	identity, err := loadGatewayIdentity(now)
+	if err != nil || !gatewayCertificateNeedsRenewal(identity.certificate, now) {
+		return controllerExitStopped, false
+	}
+
+	*lastRenewalAttempt = now
+	operationCtx, cancel := context.WithTimeout(ctx, cloudOperationTimeout)
+	renewed, renewalErr := renewGatewayCertificate(operationCtx, credentials, now)
+	cancel()
+	if renewalErr != nil || !renewed {
+		return controllerExitStopped, false
+	}
+
+	*restartAfterRenewal = true
+	stopEngine(engine)
+	if err := beginGatewayRestart(); err == nil {
+		return controllerExitRestarted, true
+	}
 	return controllerExitStopped, false
 }
 

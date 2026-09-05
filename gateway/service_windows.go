@@ -22,9 +22,7 @@ const (
 	serviceExitControllerStopped    = 5
 	serviceExitEmbeddedPayload      = 6
 	serviceExitRuntimeIdentity      = 7
-	serviceExitRestartRequested     = 8
-	serviceExitUpdateRequested      = 9
-	serviceExitRemovalRequested     = 10
+	serviceExitRemovalRequested     = 8
 )
 
 type camOSWindowsService struct {
@@ -62,7 +60,7 @@ func (service *camOSWindowsService) Execute(
 		if err := beginGatewayRemoval(); err != nil {
 			return true, serviceExitRemovalRequested
 		}
-		return true, serviceExitRemovalRequested
+		return false, 0
 	}
 	ffmpegPath, err := installedFFmpegPath()
 	if err != nil || ensureEmbeddedFFmpeg(ffmpegPath) != nil {
@@ -114,17 +112,17 @@ func (service *camOSWindowsService) Execute(
 
 		case exit := <-controllerDone:
 			cancel()
-			switch exit {
-			case controllerExitRestarted:
-				return true, serviceExitRestartRequested
-			case controllerExitUpdated:
-				return true, serviceExitUpdateRequested
-			case controllerExitRemoved:
-				return true, serviceExitRemovalRequested
-			default:
-				return true, serviceExitControllerStopped
-			}
+			return windowsServiceResult(exit)
 		}
+	}
+}
+
+func windowsServiceResult(exit controllerExit) (bool, uint32) {
+	switch exit {
+	case controllerExitRestarted, controllerExitUpdated, controllerExitRemoved:
+		return false, 0
+	default:
+		return true, serviceExitControllerStopped
 	}
 }
 

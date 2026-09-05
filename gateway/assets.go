@@ -14,6 +14,9 @@ func validateEmbeddedRelease() error {
 	if len(embeddedBootstrapCredential) == 0 {
 		return errors.New("embedded bootstrap credential unavailable; use a production build")
 	}
+	if err := validateBootstrapCredentials(embeddedBootstrapCredential); err != nil {
+		return err
+	}
 	if len(embeddedFFmpeg) == 0 {
 		return errors.New("embedded FFmpeg unavailable; use a production build")
 	}
@@ -85,6 +88,13 @@ func ensureEmbeddedFFmpeg(targetPath string) error {
 }
 
 func hashFile(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, errors.New("file is not a regular file")
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err

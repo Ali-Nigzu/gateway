@@ -1,4 +1,4 @@
-//go:build production && (darwin || linux)
+//go:build production && ((darwin && (amd64 || arm64)) || (linux && amd64))
 
 package main
 

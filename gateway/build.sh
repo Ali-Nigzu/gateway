@@ -13,6 +13,14 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 test "$(uname -s)" = "$expected_os" || { echo "$target requires a native $expected_os build host" >&2; exit 1; }
 test -s "$root/bootstrap_sa.json" || { echo "Missing gateway/bootstrap_sa.json" >&2; exit 1; }
 test -s "$root/ffmpeg" || { echo "Missing gateway/ffmpeg" >&2; exit 1; }
+grep -Eq '"type"[[:space:]]*:[[:space:]]*"service_account"' "$root/bootstrap_sa.json" || {
+  echo "bootstrap_sa.json is not a service-account credential" >&2
+  exit 1
+}
+grep -Eq '"client_email"[[:space:]]*:[[:space:]]*"gateway-bootstrap@camosbase\.iam\.gserviceaccount\.com"' "$root/bootstrap_sa.json" || {
+  echo "bootstrap_sa.json is not the camOS bootstrap service account credential" >&2
+  exit 1
+}
 
 description=$(file -b "$root/ffmpeg")
 case "$target:$description" in

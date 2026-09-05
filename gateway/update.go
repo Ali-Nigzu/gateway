@@ -168,8 +168,8 @@ func downloadGatewayCandidate(
 	if err != nil {
 		return err
 	}
-	expectedSize, err := strconv.ParseInt(file.SizeBytes, 10, 64)
-	if err != nil || expectedSize <= 0 || expectedSize > maximumGatewayArtifactSize {
+	expectedSize, sizeKnown, err := artifactExpectedSize(file.SizeBytes)
+	if err != nil {
 		return errors.New("Gateway artifact size is invalid")
 	}
 
@@ -206,14 +206,19 @@ func downloadGatewayCandidate(
 		return fmt.Errorf("Gateway artifact download failed with status %d", response.StatusCode)
 	}
 	hash := sha256.New()
+	downloadLimit := maximumGatewayArtifactSize + 1
+	if sizeKnown {
+		downloadLimit = expectedSize + 1
+	}
 	written, err := io.Copy(
 		io.MultiWriter(temporary, hash),
-		io.LimitReader(response.Body, expectedSize+1),
+		io.LimitReader(response.Body, downloadLimit),
 	)
 	if err != nil {
 		return errors.New("Gateway artifact download was incomplete")
 	}
-	if written != expectedSize {
+	if written <= 0 || written > maximumGatewayArtifactSize ||
+		(sizeKnown && written != expectedSize) {
 		return errors.New("Gateway artifact size does not match metadata")
 	}
 	if !bytes.Equal(hash.Sum(nil), expectedHash) {
@@ -233,4 +238,15 @@ func downloadGatewayCandidate(
 	}
 	keep = false
 	return syncParentDirectory(candidatePath)
+}
+
+func artifactExpectedSize(encoded string) (int64, bool, error) {
+	if encoded == "" {
+		return 0, false, nil
+	}
+	value, err := strconv.ParseInt(encoded, 10, 64)
+	if err != nil || value <= 0 || value > maximumGatewayArtifactSize {
+		return 0, false, errors.New("invalid artifact size")
+	}
+	return value, true, nil
 }

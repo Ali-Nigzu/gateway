@@ -1,4 +1,4 @@
-//go:build production && windows
+//go:build production && windows && amd64
 
 package main
 

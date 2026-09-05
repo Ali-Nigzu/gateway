@@ -2,6 +2,8 @@
 
 Production releases are built locally. They are not built or published by GitHub Actions.
 
+Use the Go 1.25.12 toolchain pinned by `go.mod`. This is the minimum release line used by the handle-safe Google X.509 workload-identity client.
+
 Place the private `bootstrap_sa.json` and the matching platform FFmpeg executable in this directory. These files and `dist/` are ignored by Git. Never commit or print their contents.
 
 Build one target at a time:

@@ -135,9 +135,16 @@ func runDarwinRemovalHelper() error {
 		return fmt.Errorf("Gateway installation removal failed: %w", err)
 	}
 
-	// Keep the supervised helper and durable marker until all permanent
-	// application files are gone. Unlink the helper's definition immediately
-	// before removing the state tree that contains the running helper itself.
+	paths, err := resolveIdentityPaths()
+	if err != nil {
+		return err
+	}
+	helperPath := filepath.Join(paths.workDirectory, removalHelperFilename)
+	if err := prepareIdentityForFinalRemoval(paths, helperPath); err != nil {
+		return err
+	}
+	// Keep the supervised helper and durable marker until every fallible
+	// permanent-file and LaunchDaemon cleanup step has completed.
 	if err := removeFileIfPresent(removalLaunchDaemonPath + ".installing"); err != nil {
 		return fmt.Errorf("removal LaunchDaemon temporary definition cleanup failed: %w", err)
 	}
@@ -146,10 +153,6 @@ func runDarwinRemovalHelper() error {
 	}
 	if err := syncParentDirectory(removalLaunchDaemonPath); err != nil {
 		return fmt.Errorf("removal LaunchDaemon directory sync failed: %w", err)
-	}
-	paths, err := resolveIdentityPaths()
-	if err != nil {
-		return err
 	}
 	if err := removeExactDirectory(paths.directory, gatewayIdentityDirectory); err != nil {
 		return fmt.Errorf("Gateway identity removal failed: %w", err)
