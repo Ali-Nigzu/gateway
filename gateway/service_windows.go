@@ -62,6 +62,9 @@ func (service *camOSWindowsService) Execute(
 		}
 		return false, 0
 	}
+	if err := clearStaleFramePackageState(); err != nil {
+		return true, serviceExitRuntimeIdentity
+	}
 	ffmpegPath, err := installedFFmpegPath()
 	if err != nil || ensureEmbeddedFFmpeg(ffmpegPath) != nil {
 		return true, serviceExitEmbeddedPayload
@@ -119,7 +122,7 @@ func (service *camOSWindowsService) Execute(
 
 func windowsServiceResult(exit controllerExit) (bool, uint32) {
 	switch exit {
-	case controllerExitRestarted, controllerExitUpdated, controllerExitRemoved:
+	case controllerExitLifecycleHandoff:
 		return false, 0
 	default:
 		return true, serviceExitControllerStopped

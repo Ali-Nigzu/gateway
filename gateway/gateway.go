@@ -14,17 +14,48 @@ const (
 	retryDelay            = 90 * time.Second
 	frameSilenceTimeout   = 90 * time.Second
 	cloudOperationTimeout = 90 * time.Second
-	runtimeFactInterval   = 90 * time.Second
 )
+
+// clearStaleFramePackageState removes package data left by an earlier process
+// before this service execution can park on credentials or control-plane
+// availability. Identity, update, and terminal-removal state are siblings of
+// frame-packages and are deliberately left untouched.
+func clearStaleFramePackageState() error {
+	paths, err := resolveIdentityPaths()
+	if err != nil {
+		return err
+	}
+	if err := prepareIdentityWorkDirectory(paths); err != nil {
+		return err
+	}
+	return removeFramePackageRoot(paths.workDirectory)
+}
 
 func startGateway(
 	ctx context.Context,
 	devices []deviceRecord,
 	credentials *runtimeCredentials,
-) error {
+) (result error) {
 	if credentials == nil {
 		return errors.New("runtime credentials are unavailable")
 	}
+	paths, err := resolveIdentityPaths()
+	if err != nil {
+		return err
+	}
+	if err := prepareIdentityWorkDirectory(paths); err != nil {
+		return err
+	}
+	packageRoot, err := resetFramePackageRoot(paths.workDirectory)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := removeFramePackageRoot(paths.workDirectory); result == nil {
+			result = err
+		}
+	}()
+
 	store, err := newPostgresStore(
 		ctx,
 		credentials.cloudPlatformTokenSource,
@@ -52,7 +83,20 @@ func startGateway(
 
 	runtimes := make([]*deviceRuntime, len(devices))
 	for index := range devices {
-		runtimes[index] = newDeviceRuntime(devices[index])
+		device := devices[index]
+		packages, err := newFramePackageCache(
+			framePackageDeviceDirectory(
+				packageRoot,
+				device.organisationID,
+				device.siteID,
+				device.id,
+			),
+			device.framePackageIntervalMinutes,
+		)
+		if err != nil {
+			return err
+		}
+		runtimes[index] = newDeviceRuntime(device, packages)
 	}
 
 	var workers sync.WaitGroup
@@ -72,13 +116,54 @@ func startGateway(
 		}()
 		go func() {
 			defer workers.Done()
-			superviseDeviceUploader(ctx, gcsClient, runtime)
+			superviseFramePackageUploader(ctx, gcsClient, runtime)
 		}()
 	}
 
 	<-ctx.Done()
 	workers.Wait()
 	return nil
+}
+
+func superviseFramePackageUploader(
+	ctx context.Context,
+	client *storage.Client,
+	runtime *deviceRuntime,
+) {
+	for {
+		func() {
+			defer func() {
+				_ = recover()
+			}()
+			runFramePackageUploader(
+				ctx,
+				runtime.packages,
+				framePackageRetryDelay(runtime.config.framePackageIntervalMinutes),
+				func(
+					uploadCtx context.Context,
+					framePackage framePackageUpload,
+				) (time.Time, error) {
+					return uploadFramePackage(
+						uploadCtx,
+						client,
+						runtime.config,
+						framePackage,
+					)
+				},
+				runtime.facts.observeUpload,
+			)
+		}()
+		if ctx.Err() != nil || !waitContext(ctx, retryDelay) {
+			return
+		}
+	}
+}
+
+func framePackageRetryDelay(intervalMinutes int) time.Duration {
+	if intervalMinutes > 0 && intervalMinutes < 3 {
+		return time.Duration(intervalMinutes) * time.Minute / 2
+	}
+	return retryDelay
 }
 
 func waitContext(ctx context.Context, delay time.Duration) bool {

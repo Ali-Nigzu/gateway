@@ -43,4 +43,4 @@ try {
     Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $temporaryOutput
 }
 
-Write-Output "Built dist/windows-amd64.exe (BuildVersion 1)"
+Write-Output "Built dist/windows-amd64.exe (BuildVersion 2)"

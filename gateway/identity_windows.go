@@ -60,6 +60,26 @@ func prepareIdentityDirectory(paths identityPaths) error {
 	return nil
 }
 
+func prepareIdentityWorkDirectory(paths identityPaths) error {
+	if filepath.Clean(filepath.Dir(paths.workDirectory)) != filepath.Clean(paths.directory) {
+		return errors.New("Gateway work directory path is invalid")
+	}
+	if err := prepareIdentityDirectory(paths); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(paths.workDirectory, 0o700); err != nil {
+		return errors.New("Gateway work directory creation failed")
+	}
+	info, err := os.Lstat(paths.workDirectory)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("Gateway work directory is invalid")
+	}
+	return applyWindowsIdentityDACL(
+		paths.workDirectory,
+		windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+	)
+}
+
 func secureIdentityFile(path string) error {
 	return applyWindowsIdentityDACL(path, windows.NO_INHERITANCE)
 }
@@ -200,22 +220,6 @@ func loadGatewayID() (uuid.UUID, error) {
 func gatewayIDCommitPresent() (bool, error) {
 	_, present, err := readStoredGatewayID()
 	return present, err
-}
-
-func storedGatewayIDMatches(gatewayID uuid.UUID) (bool, error) {
-	encoded, present, err := readStoredGatewayID()
-	if err != nil {
-		return false, fmt.Errorf("GatewayID read failed: %w", err)
-	}
-	if !present {
-		return false, nil
-	}
-
-	storedGatewayID, err := uuid.Parse(encoded)
-	if err != nil {
-		return false, nil
-	}
-	return storedGatewayID == gatewayID, nil
 }
 
 func readStoredGatewayID() (string, bool, error) {

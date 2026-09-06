@@ -7,17 +7,20 @@ import (
 	"testing"
 )
 
-type flattenedDeviceScanner struct{}
+type flattenedDeviceScanner struct {
+	rtspURI                     sql.NullString
+	framePackageIntervalMinutes int
+}
 
-func (flattenedDeviceScanner) Scan(destinations ...any) error {
-	if len(destinations) != 13 {
-		return fmt.Errorf("destination count = %d, want 13", len(destinations))
+func (scanner flattenedDeviceScanner) Scan(destinations ...any) error {
+	if len(destinations) != 14 {
+		return fmt.Errorf("destination count = %d, want 14", len(destinations))
 	}
 	*destinations[0].(*int64) = 83
 	*destinations[1].(*int64) = 42
 	*destinations[2].(*int64) = 17
 	*destinations[3].(*bool) = true
-	*destinations[4].(*string) = "rtsp://camera.example/live"
+	*destinations[4].(*sql.NullString) = scanner.rtspURI
 	*destinations[5].(*sql.NullString) = sql.NullString{
 		String: "camera user",
 		Valid:  true,
@@ -27,11 +30,12 @@ func (flattenedDeviceScanner) Scan(destinations ...any) error {
 		Valid:  true,
 	}
 	*destinations[7].(*int) = 4
-	*destinations[8].(*int32) = 1234
-	*destinations[9].(*sql.NullInt16) = sql.NullInt16{Int16: 1, Valid: true}
-	*destinations[10].(*sql.NullInt16) = sql.NullInt16{Int16: 2, Valid: true}
-	*destinations[11].(*sql.NullInt16) = sql.NullInt16{Int16: 3, Valid: true}
-	*destinations[12].(*sql.NullInt16) = sql.NullInt16{Int16: 4, Valid: true}
+	*destinations[8].(*int) = scanner.framePackageIntervalMinutes
+	*destinations[9].(*int32) = 1234
+	*destinations[10].(*sql.NullInt16) = sql.NullInt16{Int16: 1, Valid: true}
+	*destinations[11].(*sql.NullInt16) = sql.NullInt16{Int16: 2, Valid: true}
+	*destinations[12].(*sql.NullInt16) = sql.NullInt16{Int16: 3, Valid: true}
+	*destinations[13].(*sql.NullInt16) = sql.NullInt16{Int16: 4, Valid: true}
 	return nil
 }
 
@@ -44,6 +48,7 @@ func TestLoadDevicesStatementUsesFlattenedProductionSchema(t *testing.T) {
 		"d.rtsp_username",
 		"d.rtsp_password",
 		"d.capture_fps",
+		"d.frame_package_interval_minutes",
 		"d.change_threshold_bp",
 		"d.line_ax",
 		"d.line_ay",
@@ -60,6 +65,7 @@ func TestLoadDevicesStatementUsesFlattenedProductionSchema(t *testing.T) {
 		"rtsp_config",
 		"capture_config",
 		"analysis_config",
+		"analysis_interval_minutes",
 		".status",
 	} {
 		if strings.Contains(loadDevicesStatement, forbidden) {
@@ -69,7 +75,13 @@ func TestLoadDevicesStatementUsesFlattenedProductionSchema(t *testing.T) {
 }
 
 func TestScanDeviceRecordMapsFlattenedFields(t *testing.T) {
-	record, err := scanDeviceRecord(flattenedDeviceScanner{})
+	record, err := scanDeviceRecord(flattenedDeviceScanner{
+		rtspURI: sql.NullString{
+			String: "rtsp://camera.example/live",
+			Valid:  true,
+		},
+		framePackageIntervalMinutes: 15,
+	})
 	if err != nil {
 		t.Fatalf("scanDeviceRecord() error = %v", err)
 	}
@@ -85,6 +97,12 @@ func TestScanDeviceRecordMapsFlattenedFields(t *testing.T) {
 	if record.captureFPS != 4 {
 		t.Fatalf("captureFPS = %d, want 4", record.captureFPS)
 	}
+	if record.framePackageIntervalMinutes != 15 {
+		t.Fatalf(
+			"framePackageIntervalMinutes = %d, want 15",
+			record.framePackageIntervalMinutes,
+		)
+	}
 	if record.changeThresholdPercent != 12.34 {
 		t.Fatalf(
 			"changeThresholdPercent = %v, want 12.34",
@@ -97,13 +115,26 @@ func TestScanDeviceRecordMapsFlattenedFields(t *testing.T) {
 	}
 }
 
-func TestDatabaseDeviceRecordMapsNullCredentialsToEmpty(t *testing.T) {
+func TestDatabaseDeviceRecordMapsNullRTSPFieldsToEmpty(t *testing.T) {
 	record := databaseDeviceRecord{
+		rtspURI:      sql.NullString{String: "ignored", Valid: false},
 		rtspUsername: sql.NullString{String: "ignored", Valid: false},
 		rtspPassword: sql.NullString{String: "ignored", Valid: false},
 	}.runtimeRecord()
-	if record.rtspUsername != "" || record.rtspPassword != "" {
-		t.Fatalf("NULL credentials were not mapped to empty strings")
+	if record.rtspURI != "" || record.rtspUsername != "" || record.rtspPassword != "" {
+		t.Fatalf("NULL RTSP fields were not mapped to empty strings")
+	}
+}
+
+func TestScanDeviceRecordRejectsNonPositiveFramePackageInterval(t *testing.T) {
+	for _, interval := range []int{0, -1} {
+		_, err := scanDeviceRecord(flattenedDeviceScanner{
+			rtspURI:                     sql.NullString{String: "rtsp://camera.example/live", Valid: true},
+			framePackageIntervalMinutes: interval,
+		})
+		if err == nil {
+			t.Errorf("scanDeviceRecord() accepted interval %d", interval)
+		}
 	}
 }
 

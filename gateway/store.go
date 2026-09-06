@@ -30,6 +30,7 @@ const (
     d.rtsp_username,
     d.rtsp_password,
     d.capture_fps,
+    d.frame_package_interval_minutes,
     d.change_threshold_bp,
     d.line_ax,
     d.line_ay,
@@ -77,35 +78,37 @@ WHERE gateway_id = $1::uuid`
 )
 
 type deviceRecord struct {
-	id                     int64
-	organisationID         int64
-	siteID                 int64
-	enabled                bool
-	rtspURI                string
-	rtspUsername           string
-	rtspPassword           string
-	captureFPS             int
-	changeThresholdPercent float64
-	lineAX                 sql.NullInt16
-	lineAY                 sql.NullInt16
-	lineBX                 sql.NullInt16
-	lineBY                 sql.NullInt16
+	id                          int64
+	organisationID              int64
+	siteID                      int64
+	enabled                     bool
+	rtspURI                     string
+	rtspUsername                string
+	rtspPassword                string
+	captureFPS                  int
+	framePackageIntervalMinutes int
+	changeThresholdPercent      float64
+	lineAX                      sql.NullInt16
+	lineAY                      sql.NullInt16
+	lineBX                      sql.NullInt16
+	lineBY                      sql.NullInt16
 }
 
 type databaseDeviceRecord struct {
-	id                int64
-	organisationID    int64
-	siteID            int64
-	enabled           bool
-	rtspURI           string
-	rtspUsername      sql.NullString
-	rtspPassword      sql.NullString
-	captureFPS        int
-	changeThresholdBP int32
-	lineAX            sql.NullInt16
-	lineAY            sql.NullInt16
-	lineBX            sql.NullInt16
-	lineBY            sql.NullInt16
+	id                          int64
+	organisationID              int64
+	siteID                      int64
+	enabled                     bool
+	rtspURI                     sql.NullString
+	rtspUsername                sql.NullString
+	rtspPassword                sql.NullString
+	captureFPS                  int
+	framePackageIntervalMinutes int
+	changeThresholdBP           int32
+	lineAX                      sql.NullInt16
+	lineAY                      sql.NullInt16
+	lineBX                      sql.NullInt16
+	lineBY                      sql.NullInt16
 }
 
 type rowScanner interface {
@@ -192,6 +195,7 @@ func scanDeviceRecord(scanner rowScanner) (deviceRecord, error) {
 		&databaseRecord.rtspUsername,
 		&databaseRecord.rtspPassword,
 		&databaseRecord.captureFPS,
+		&databaseRecord.framePackageIntervalMinutes,
 		&databaseRecord.changeThresholdBP,
 		&databaseRecord.lineAX,
 		&databaseRecord.lineAY,
@@ -200,24 +204,28 @@ func scanDeviceRecord(scanner rowScanner) (deviceRecord, error) {
 	); err != nil {
 		return deviceRecord{}, err
 	}
+	if databaseRecord.framePackageIntervalMinutes <= 0 {
+		return deviceRecord{}, errors.New("invalid frame package interval")
+	}
 	return databaseRecord.runtimeRecord(), nil
 }
 
 func (record databaseDeviceRecord) runtimeRecord() deviceRecord {
 	return deviceRecord{
-		id:                     record.id,
-		organisationID:         record.organisationID,
-		siteID:                 record.siteID,
-		enabled:                record.enabled,
-		rtspURI:                record.rtspURI,
-		rtspUsername:           nullableString(record.rtspUsername),
-		rtspPassword:           nullableString(record.rtspPassword),
-		captureFPS:             record.captureFPS,
-		changeThresholdPercent: float64(record.changeThresholdBP) / 100,
-		lineAX:                 record.lineAX,
-		lineAY:                 record.lineAY,
-		lineBX:                 record.lineBX,
-		lineBY:                 record.lineBY,
+		id:                          record.id,
+		organisationID:              record.organisationID,
+		siteID:                      record.siteID,
+		enabled:                     record.enabled,
+		rtspURI:                     nullableString(record.rtspURI),
+		rtspUsername:                nullableString(record.rtspUsername),
+		rtspPassword:                nullableString(record.rtspPassword),
+		captureFPS:                  record.captureFPS,
+		framePackageIntervalMinutes: record.framePackageIntervalMinutes,
+		changeThresholdPercent:      float64(record.changeThresholdBP) / 100,
+		lineAX:                      record.lineAX,
+		lineAY:                      record.lineAY,
+		lineBX:                      record.lineBX,
+		lineBY:                      record.lineBY,
 	}
 }
 

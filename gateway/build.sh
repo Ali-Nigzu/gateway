@@ -43,4 +43,4 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
   (cd "$root/dist" && shasum -a 256 "$target") > "$root/dist/SHA256SUMS"
 fi
-echo "Built dist/$target (BuildVersion 1)"
+echo "Built dist/$target (BuildVersion 2)"
