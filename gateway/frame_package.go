@@ -620,8 +620,23 @@ func writeFramePackageTar(writer io.Writer, upload framePackageUpload) error {
 	})
 
 	tarWriter := tar.NewWriter(writer)
+	var (
+		previousTimestamp string
+		collisionOrdinal  int
+	)
 	for _, frame := range frames {
-		if err := writeFramePackageEntry(tarWriter, frame); err != nil {
+		timestamp := frame.capturedAt.UTC().Format(framePackageTimeLayout)
+		if timestamp == previousTimestamp {
+			collisionOrdinal++
+		} else {
+			previousTimestamp = timestamp
+			collisionOrdinal = 1
+		}
+		entryName := timestamp + ".jpg"
+		if collisionOrdinal > 1 {
+			entryName = fmt.Sprintf("%s__%06d.jpg", timestamp, collisionOrdinal)
+		}
+		if err := writeFramePackageEntry(tarWriter, frame, entryName); err != nil {
 			return err
 		}
 	}
@@ -631,7 +646,11 @@ func writeFramePackageTar(writer io.Writer, upload framePackageUpload) error {
 	return nil
 }
 
-func writeFramePackageEntry(writer *tar.Writer, frame framePackageFrame) error {
+func writeFramePackageEntry(
+	writer *tar.Writer,
+	frame framePackageFrame,
+	entryName string,
+) error {
 	file, err := os.Open(frame.path)
 	if err != nil {
 		return errors.New("frame package frame is unavailable")
@@ -644,7 +663,7 @@ func writeFramePackageEntry(writer *tar.Writer, frame framePackageFrame) error {
 
 	header := &tar.Header{
 		Typeflag: tar.TypeReg,
-		Name:     frame.capturedAt.UTC().Format(framePackageTimeLayout) + ".jpg",
+		Name:     entryName,
 		Mode:     0o600,
 		Size:     frame.size,
 		ModTime:  time.Unix(0, 0).UTC(),

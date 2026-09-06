@@ -62,6 +62,9 @@ func (service *camOSWindowsService) Execute(
 		}
 		return false, 0
 	}
+	if err := clearStaleFramePackageState(); err != nil {
+		return true, serviceExitRuntimeIdentity
+	}
 	ffmpegPath, err := installedFFmpegPath()
 	if err != nil || ensureEmbeddedFFmpeg(ffmpegPath) != nil {
 		return true, serviceExitEmbeddedPayload

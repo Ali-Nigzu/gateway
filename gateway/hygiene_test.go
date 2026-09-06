@@ -38,3 +38,24 @@ func TestRuntimeSourcesContainNoLegacyCredentialOrSchemaDependency(t *testing.T)
 		}
 	}
 }
+
+func TestEveryNativeServiceClearsStaleFramePackagesBeforeRuntimeStartup(t *testing.T) {
+	for _, name := range []string{
+		"service_windows.go",
+		"service_linux.go",
+		"service_darwin.go",
+	} {
+		encoded, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		source := string(encoded)
+		cleanup := strings.Index(source, "clearStaleFramePackageState()")
+		ffmpeg := strings.Index(source, "installedFFmpegPath()")
+		credentials := strings.Index(source, "newRuntimeCredentials(")
+		if cleanup < 0 || ffmpeg < 0 || credentials < 0 ||
+			cleanup > ffmpeg || cleanup > credentials {
+			t.Fatalf("%s does not clear stale frame packages before runtime startup", name)
+		}
+	}
+}

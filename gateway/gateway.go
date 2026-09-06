@@ -16,6 +16,21 @@ const (
 	cloudOperationTimeout = 90 * time.Second
 )
 
+// clearStaleFramePackageState removes package data left by an earlier process
+// before this service execution can park on credentials or control-plane
+// availability. Identity, update, and terminal-removal state are siblings of
+// frame-packages and are deliberately left untouched.
+func clearStaleFramePackageState() error {
+	paths, err := resolveIdentityPaths()
+	if err != nil {
+		return err
+	}
+	if err := prepareIdentityWorkDirectory(paths); err != nil {
+		return err
+	}
+	return removeFramePackageRoot(paths.workDirectory)
+}
+
 func startGateway(
 	ctx context.Context,
 	devices []deviceRecord,

@@ -132,7 +132,7 @@ func TestFramePackageTarIsDeterministicAndChronological(t *testing.T) {
 	reader := tar.NewReader(bytes.NewReader(first.Bytes()))
 	wantNames := []string{
 		"2026-09-06T11-00-10.111Z.jpg",
-		"2026-09-06T11-00-10.111Z.jpg",
+		"2026-09-06T11-00-10.111Z__000002.jpg",
 		"2026-09-06T11-00-30.444Z.jpg",
 	}
 	wantPayloads := []string{"first", "second", "third"}
@@ -326,6 +326,69 @@ func TestFramePackageUploaderRetriesSameCompletedPackage(t *testing.T) {
 	}
 }
 
+func TestFramePackageUploaderCancelsAndDiscardsAtLifetimeBoundary(t *testing.T) {
+	cache := newTestFramePackageCache(t, 1)
+	now := time.Now().UTC()
+	window, err := canonicalFramePackageWindow(now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.addFrame(now, []byte("A")); err != nil {
+		t.Fatal(err)
+	}
+	cache.advance(window.end)
+	upload, ok := cache.completedUpload()
+	if !ok {
+		t.Fatal("A did not close")
+	}
+	cache.mutex.Lock()
+	cache.completed.expiresAt = time.Now().UTC().Add(5 * time.Second)
+	cache.mutex.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	attemptStarted := make(chan struct{})
+	attemptFinished := make(chan struct{})
+	go runFramePackageUploader(
+		ctx,
+		cache,
+		time.Second,
+		func(uploadCtx context.Context, _ framePackageUpload) (time.Time, error) {
+			close(attemptStarted)
+			<-uploadCtx.Done()
+			close(attemptFinished)
+			return time.Time{}, uploadCtx.Err()
+		},
+		nil,
+	)
+	select {
+	case <-attemptStarted:
+	case <-time.After(time.Second):
+		t.Fatal("package upload did not start")
+	}
+	boundary := time.Now().UTC()
+	cache.mutex.Lock()
+	cache.completed.expiresAt = boundary
+	cache.mutex.Unlock()
+	cache.advance(boundary)
+	select {
+	case <-attemptFinished:
+	case <-time.After(time.Second):
+		t.Fatal("expired upload did not honor cancellation")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		_, statErr := os.Stat(upload.directory)
+		if errors.Is(statErr, os.ErrNotExist) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expired package was not discarded: %v", statErr)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestFramePackageRetryDelayAllowsRetryWithinShortWindow(t *testing.T) {
 	tests := []struct {
 		minutes int
@@ -343,8 +406,12 @@ func TestFramePackageRetryDelayAllowsRetryWithinShortWindow(t *testing.T) {
 	}
 }
 
-func TestResetFramePackageDirectoryDiscardsPreviousExecution(t *testing.T) {
+func TestResetFramePackageRootDiscardsOnlyPreviousPackageState(t *testing.T) {
 	work := t.TempDir()
+	helper := filepath.Join(work, "lifecycle-helper.exe")
+	if err := os.WriteFile(helper, []byte("helper"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	root, err := resetFramePackageRoot(work)
 	if err != nil {
 		t.Fatal(err)
@@ -366,11 +433,17 @@ func TestResetFramePackageDirectoryDiscardsPreviousExecution(t *testing.T) {
 	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stale package survived restart: %v", err)
 	}
+	if encoded, err := os.ReadFile(helper); err != nil || string(encoded) != "helper" {
+		t.Fatalf("package reset touched lifecycle state: %q, %v", encoded, err)
+	}
 	if err := removeFramePackageRoot(work); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("package root survived shutdown: %v", err)
+	}
+	if _, err := os.Stat(helper); err != nil {
+		t.Fatalf("package shutdown cleanup touched lifecycle state: %v", err)
 	}
 }
 

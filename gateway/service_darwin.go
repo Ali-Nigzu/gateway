@@ -22,6 +22,9 @@ func runService() error {
 	if pending {
 		return beginGatewayRemoval()
 	}
+	if err := clearStaleFramePackageState(); err != nil {
+		return err
+	}
 	ffmpegPath, err := installedFFmpegPath()
 	if err != nil {
 		return err
