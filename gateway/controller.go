@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"slices"
 	"time"
@@ -10,8 +11,6 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/oauth2"
 )
-
-const certificateRenewalRetryInterval = 24 * time.Hour
 
 type gatewayControl struct {
 	siteID              sql.NullInt64
@@ -27,27 +26,41 @@ type controllerExit uint8
 
 const (
 	controllerExitStopped controllerExit = iota
-	controllerExitRestarted
-	controllerExitUpdated
-	controllerExitRemoved
+	controllerExitLifecycleHandoff
 )
 
 type controlPriority uint8
 
 const (
-	controlPriorityPreserve controlPriority = iota
-	controlPriorityPark
+	controlPriorityPark controlPriority = iota
 	controlPriorityRun
 	controlPriorityUpdate
 	controlPriorityRemove
 )
 
+// runnableSnapshot keeps Gateway control and the device configuration read for
+// that exact route together. A controller never constructs an engine from
+// independently cached control and device values.
+type runnableSnapshot struct {
+	control gatewayControl
+	devices []deviceRecord
+}
+
 type activeEngine struct {
-	siteID    int64
-	devices   []deviceRecord
-	startedAt time.Time
-	cancel    context.CancelFunc
-	done      chan error
+	organisationID int64
+	siteID         int64
+	devices        []deviceRecord
+	startedAt      time.Time
+	cancel         context.CancelFunc
+	done           chan error
+}
+
+type controllerRuntime struct {
+	credentials              *runtimeCredentials
+	store                    *postgresStore
+	runnable                 *runnableSnapshot
+	engine                   *activeEngine
+	credentialRestartPending bool
 }
 
 func runController(
@@ -58,296 +71,229 @@ func runController(
 	if credentials == nil {
 		return controllerExitStopped
 	}
-	var (
-		store               *postgresStore
-		lastControl         gatewayControl
-		lastDevices         []deviceRecord
-		haveControl         bool
-		haveDevices         bool
-		engine              *activeEngine
-		lastRenewalAttempt  time.Time
-		restartAfterRenewal bool
-	)
+	controller := controllerRuntime{credentials: credentials}
 
 	timer := time.NewTimer(0)
 	defer timer.Stop()
-	defer func() {
-		stopEngine(&engine)
-		if store != nil {
-			store.close()
-		}
-	}()
+	defer controller.close()
 
 	for {
 		var engineDone <-chan error
-		if engine != nil {
-			engineDone = engine.done
+		if controller.engine != nil {
+			engineDone = controller.engine.done
 		}
 
+		forceRestart := false
 		select {
 		case <-ctx.Done():
 			return controllerExitStopped
 
 		case <-timer.C:
-			exit, finished := runControllerCycle(
-				ctx,
-				credentials,
-				&store,
-				false,
-				&lastControl,
-				&lastDevices,
-				&haveControl,
-				&haveDevices,
-				&engine,
-				&lastRenewalAttempt,
-				&restartAfterRenewal,
-			)
-			if finished {
-				return exit
-			}
-			timer.Reset(retryDelay)
-
 		case <-resume:
-			exit, finished := runControllerCycle(
-				ctx,
-				credentials,
-				&store,
-				true,
-				&lastControl,
-				&lastDevices,
-				&haveControl,
-				&haveDevices,
-				&engine,
-				&lastRenewalAttempt,
-				&restartAfterRenewal,
-			)
-			if finished {
-				return exit
-			}
-			resetControllerTimer(timer)
+			forceRestart = true
 
 		case <-engineDone:
-			engine.cancel()
-			engine = nil
+			controller.engine.cancel()
+			controller.engine = nil
+			continue
+		}
+
+		if controller.runCycle(ctx, forceRestart) {
+			return controllerExitLifecycleHandoff
+		}
+		if forceRestart {
+			resetControllerTimer(timer)
+		} else {
+			timer.Reset(retryDelay)
 		}
 	}
 }
 
-func runControllerCycle(
+func (controller *controllerRuntime) close() {
+	stopEngine(&controller.engine)
+	if controller.store != nil {
+		controller.store.close()
+	}
+}
+
+func (controller *controllerRuntime) runCycle(
 	ctx context.Context,
-	credentials *runtimeCredentials,
-	store **postgresStore,
 	forceRestart bool,
-	lastControl *gatewayControl,
-	lastDevices *[]deviceRecord,
-	haveControl *bool,
-	haveDevices *bool,
-	engine **activeEngine,
-	lastRenewalAttempt *time.Time,
-	restartAfterRenewal *bool,
-) (controllerExit, bool) {
-	control, fresh := pollGatewayControl(ctx, credentials, store)
-	if !fresh {
+) bool {
+	control, err := controller.pollGatewayControl(ctx)
+	if err != nil {
 		// A failed DB read can never authorize terminal removal, but renewal is
 		// independent of Postgres and must keep progressing through a long DB
 		// outage so the appliance does not strand itself with an expired cert.
-		if exit, finished := reconcileCertificateLifecycle(
-			ctx,
-			credentials,
-			engine,
-			lastRenewalAttempt,
-			restartAfterRenewal,
-		); finished {
-			return exit, true
+		if controller.reconcileCertificateLifecycle(ctx) {
+			return true
 		}
-		if forceRestart && *haveControl && *haveDevices {
-			reconcileEngine(ctx, credentials, *lastControl, *lastDevices, true, engine)
+		if forceRestart && controller.runnable != nil {
+			controller.reconcileEngine(ctx, controller.runnable, true)
 		}
-		return controllerExitStopped, false
+		return false
 	}
 
-	*lastControl = control
-	*haveControl = true
-	if controlPriorityFor(control, true) == controlPriorityRemove {
-		stopEngine(engine)
-		if err := beginGatewayRemoval(); err == nil {
-			return controllerExitRemoved, true
-		}
-		return controllerExitStopped, false
+	if controlPriorityFor(control) == controlPriorityRemove {
+		return controller.beginRemoval()
 	}
 
-	completePendingCommission(ctx, *store, credentials.gatewayID)
+	completePendingCommission(ctx, controller.store, controller.credentials.gatewayID)
 
-	if controlPriorityFor(control, true) == controlPriorityUpdate {
-		exit, finished, revalidated := reconcileGatewayVersion(
-			ctx,
-			credentials,
-			*store,
-			control,
-			engine,
-		)
+	if controlPriorityFor(control) == controlPriorityUpdate {
+		revalidated, finished := controller.reconcileGatewayVersion(ctx, control)
 		if finished {
-			return exit, true
+			return true
 		}
 		if revalidated != nil {
 			control = *revalidated
-			*lastControl = control
+			if controlPriorityFor(control) == controlPriorityRemove {
+				return controller.beginRemoval()
+			}
 		}
 	}
 
-	if exit, finished := reconcileCertificateLifecycle(
-		ctx,
-		credentials,
-		engine,
-		lastRenewalAttempt,
-		restartAfterRenewal,
-	); finished {
-		return exit, true
+	if controller.reconcileCertificateLifecycle(ctx) {
+		return true
 	}
 
 	if !gatewayControlRunsCamera(control) {
-		*haveDevices = false
-		*lastDevices = nil
-		reconcileEngine(ctx, credentials, control, nil, forceRestart, engine)
-		return controllerExitStopped, false
+		controller.park()
+		return false
 	}
 
 	operationCtx, cancel := context.WithTimeout(ctx, cloudOperationTimeout)
-	devices, err := (*store).loadDevices(operationCtx, control.siteID.Int64)
+	devices, err := controller.store.loadDevices(operationCtx, control.siteID.Int64)
 	cancel()
 	if err != nil {
-		// A fresh control change can safely park the old site's engine, but a
-		// transient device read failure must not tear down a still-valid run.
-		if *engine != nil && (*engine).siteID != control.siteID.Int64 {
-			stopEngine(engine)
-		}
-		return controllerExitStopped, false
+		controller.preserveOnlyMatchingRoute(control)
+		return false
 	}
-	*lastDevices = slices.Clone(devices)
-	*haveDevices = true
-	reconcileEngine(ctx, credentials, control, devices, forceRestart, engine)
-	return controllerExitStopped, false
+
+	snapshot, valid := newRunnableSnapshot(control, devices)
+	if !valid {
+		controller.preserveOnlyMatchingRoute(control)
+		return false
+	}
+	controller.runnable = snapshot
+	controller.reconcileEngine(ctx, snapshot, forceRestart)
+	return false
 }
 
-func reconcileCertificateLifecycle(
+func (controller *controllerRuntime) beginRemoval() bool {
+	controller.park()
+	if err := beginGatewayRemoval(); err != nil {
+		return false
+	}
+	return true
+}
+
+type certificateRenewalFunc func(
+	context.Context,
+	*runtimeCredentials,
+	time.Time,
+) (bool, error)
+
+func (controller *controllerRuntime) reconcileCertificateLifecycle(
 	ctx context.Context,
-	credentials *runtimeCredentials,
-	engine **activeEngine,
-	lastRenewalAttempt *time.Time,
-	restartAfterRenewal *bool,
-) (controllerExit, bool) {
-	if *restartAfterRenewal {
-		stopEngine(engine)
-		if err := beginGatewayRestart(); err == nil {
-			return controllerExitRestarted, true
-		}
-		return controllerExitStopped, false
+) bool {
+	return controller.reconcileCertificateLifecycleWith(
+		ctx,
+		time.Now().UTC(),
+		renewGatewayCertificate,
+		beginGatewayRestart,
+	)
+}
+
+func (controller *controllerRuntime) reconcileCertificateLifecycleWith(
+	ctx context.Context,
+	now time.Time,
+	renew certificateRenewalFunc,
+	restart func() error,
+) bool {
+	if controller.credentialRestartPending {
+		stopEngine(&controller.engine)
+		return restart() == nil
 	}
 
-	now := time.Now().UTC()
-	if !lastRenewalAttempt.IsZero() && now.Sub(*lastRenewalAttempt) < certificateRenewalRetryInterval {
-		return controllerExitStopped, false
-	}
-	identity, err := loadGatewayIdentity(now)
-	if err != nil || !gatewayCertificateNeedsRenewal(identity.certificate, now) {
-		return controllerExitStopped, false
-	}
-
-	*lastRenewalAttempt = now
 	operationCtx, cancel := context.WithTimeout(ctx, cloudOperationTimeout)
-	renewed, renewalErr := renewGatewayCertificate(operationCtx, credentials, now)
+	renewed, err := renew(operationCtx, controller.credentials, now)
 	cancel()
-	if renewalErr != nil || !renewed {
-		return controllerExitStopped, false
+	if err != nil || !renewed {
+		return false
 	}
 
-	*restartAfterRenewal = true
-	stopEngine(engine)
-	if err := beginGatewayRestart(); err == nil {
-		return controllerExitRestarted, true
-	}
-	return controllerExitStopped, false
+	controller.credentialRestartPending = true
+	stopEngine(&controller.engine)
+	return restart() == nil
 }
 
-func pollGatewayControl(
+func (controller *controllerRuntime) pollGatewayControl(
 	ctx context.Context,
-	credentials *runtimeCredentials,
-	store **postgresStore,
-) (gatewayControl, bool) {
-	if credentials == nil {
-		return gatewayControl{}, false
+) (gatewayControl, error) {
+	if controller.credentials == nil {
+		return gatewayControl{}, errors.New("runtime credentials are unavailable")
 	}
-	if *store == nil {
+	if controller.store == nil {
 		created, err := newPostgresStore(
 			ctx,
-			credentials.cloudPlatformTokenSource,
-			credentials.databaseLoginTokenSource,
+			controller.credentials.cloudPlatformTokenSource,
+			controller.credentials.databaseLoginTokenSource,
 		)
 		if err != nil {
-			return gatewayControl{}, false
+			return gatewayControl{}, err
 		}
-		*store = created
+		controller.store = created
 	}
 
 	operationCtx, cancel := context.WithTimeout(ctx, cloudOperationTimeout)
-	control, err := (*store).refreshGatewayControl(
+	control, err := controller.store.refreshGatewayControl(
 		operationCtx,
-		credentials.gatewayID,
+		controller.credentials.gatewayID,
 		BuildVersion,
 	)
 	cancel()
-	return control, err == nil
+	return control, err
 }
 
-func reconcileGatewayVersion(
+func (controller *controllerRuntime) reconcileGatewayVersion(
 	ctx context.Context,
-	credentials *runtimeCredentials,
-	store *postgresStore,
 	original gatewayControl,
-	engine **activeEngine,
-) (controllerExit, bool, *gatewayControl) {
+) (*gatewayControl, bool) {
 	candidate, err := candidateExecutablePath()
 	if err != nil {
-		return controllerExitStopped, false, nil
+		return nil, false
 	}
-	client := oauth2.NewClient(ctx, credentials.cloudPlatformTokenSource)
+	client := oauth2.NewClient(ctx, controller.credentials.cloudPlatformTokenSource)
 	client.Timeout = cloudOperationTimeout
 	operationCtx, cancel := context.WithTimeout(ctx, cloudOperationTimeout)
 	err = downloadGatewayCandidate(operationCtx, client, original.desiredVersion, candidate)
 	cancel()
 	if err != nil {
-		return controllerExitStopped, false, nil
+		return nil, false
 	}
 
 	operationCtx, cancel = context.WithTimeout(ctx, cloudOperationTimeout)
-	revalidated, err := store.refreshGatewayControl(
+	revalidated, err := controller.store.refreshGatewayControl(
 		operationCtx,
-		credentials.gatewayID,
+		controller.credentials.gatewayID,
 		BuildVersion,
 	)
 	cancel()
 	if err != nil {
 		removeCandidate(candidate)
-		return controllerExitStopped, false, nil
+		return nil, false
 	}
-	if controlPriorityFor(revalidated, true) == controlPriorityRemove {
+	if !candidateTargetStillCurrent(original.desiredVersion, revalidated) {
 		removeCandidate(candidate)
-		stopEngine(engine)
-		if err := beginGatewayRemoval(); err == nil {
-			return controllerExitRemoved, true, &revalidated
-		}
-		return controllerExitStopped, false, &revalidated
-	}
-	if !candidateTargetStillCurrent(original.desiredVersion, revalidated, true) {
-		removeCandidate(candidate)
-		return controllerExitStopped, false, &revalidated
+		return &revalidated, false
 	}
 
-	stopEngine(engine)
+	stopEngine(&controller.engine)
 	if err := applyGatewayUpdate(candidate); err != nil {
-		return controllerExitStopped, false, &revalidated
+		return &revalidated, false
 	}
-	return controllerExitUpdated, true, &revalidated
+	return &revalidated, true
 }
 
 func completePendingCommission(ctx context.Context, store *postgresStore, gatewayID uuid.UUID) {
@@ -380,10 +326,7 @@ func gatewayControlRunsCamera(control gatewayControl) bool {
 		control.siteEnabled.Valid && control.siteEnabled.Bool
 }
 
-func controlPriorityFor(control gatewayControl, fresh bool) controlPriority {
-	if !fresh {
-		return controlPriorityPreserve
-	}
+func controlPriorityFor(control gatewayControl) controlPriority {
 	if control.desiredState == 0 && !control.siteID.Valid {
 		return controlPriorityRemove
 	}
@@ -399,9 +342,8 @@ func controlPriorityFor(control gatewayControl, fresh bool) controlPriority {
 func candidateTargetStillCurrent(
 	downloadedVersion int16,
 	revalidated gatewayControl,
-	fresh bool,
 ) bool {
-	return fresh && controlPriorityFor(revalidated, fresh) != controlPriorityRemove &&
+	return controlPriorityFor(revalidated) != controlPriorityRemove &&
 		downloadedVersion > 0 && revalidated.desiredVersion == downloadedVersion &&
 		revalidated.desiredVersion != BuildVersion
 }
@@ -411,51 +353,89 @@ func removeCandidate(path string) {
 	_ = os.Remove(path + ".downloading")
 }
 
-func reconcileEngine(
-	ctx context.Context,
-	credentials *runtimeCredentials,
+func newRunnableSnapshot(
 	control gatewayControl,
 	devices []deviceRecord,
-	forceRestart bool,
-	engine **activeEngine,
-) {
+) (*runnableSnapshot, bool) {
 	if !gatewayControlRunsCamera(control) {
-		stopEngine(engine)
+		return nil, false
+	}
+	for _, device := range devices {
+		if device.siteID != control.siteID.Int64 ||
+			device.organisationID != control.organisationID.Int64 {
+			return nil, false
+		}
+	}
+	return &runnableSnapshot{
+		control: control,
+		devices: slices.Clone(devices),
+	}, true
+}
+
+func gatewayControlRoutesMatch(first, second gatewayControl) bool {
+	return first.siteID.Valid && second.siteID.Valid &&
+		first.organisationID.Valid && second.organisationID.Valid &&
+		first.siteID.Int64 == second.siteID.Int64 &&
+		first.organisationID.Int64 == second.organisationID.Int64
+}
+
+func (controller *controllerRuntime) preserveOnlyMatchingRoute(control gatewayControl) {
+	if controller.runnable != nil &&
+		gatewayControlRoutesMatch(controller.runnable.control, control) {
+		return
+	}
+	controller.park()
+}
+
+func (controller *controllerRuntime) park() {
+	controller.runnable = nil
+	stopEngine(&controller.engine)
+}
+
+func (controller *controllerRuntime) reconcileEngine(
+	ctx context.Context,
+	snapshot *runnableSnapshot,
+	forceRestart bool,
+) {
+	if snapshot == nil {
+		controller.park()
 		return
 	}
 
-	shouldStart := *engine == nil
-	shouldReplace := !shouldStart && ((*engine).siteID != control.siteID.Int64 ||
-		!slices.Equal((*engine).devices, devices) ||
+	control := snapshot.control
+	shouldStart := controller.engine == nil
+	shouldReplace := !shouldStart && (controller.engine.siteID != control.siteID.Int64 ||
+		controller.engine.organisationID != control.organisationID.Int64 ||
+		!slices.Equal(controller.engine.devices, snapshot.devices) ||
 		forceRestart ||
 		(control.restartRequestedAt.Valid &&
-			control.restartRequestedAt.Time.After((*engine).startedAt)))
+			control.restartRequestedAt.Time.After(controller.engine.startedAt)))
 
 	if shouldReplace {
-		stopEngine(engine)
+		stopEngine(&controller.engine)
 		shouldStart = true
 	}
 	if shouldStart && ctx.Err() == nil {
-		*engine = startEngine(ctx, credentials, control.siteID.Int64, devices)
+		controller.engine = startEngine(ctx, controller.credentials, snapshot)
 	}
 }
 
 func startEngine(
 	ctx context.Context,
 	credentials *runtimeCredentials,
-	siteID int64,
-	devices []deviceRecord,
+	snapshot *runnableSnapshot,
 ) *activeEngine {
 	engineCtx, cancel := context.WithCancel(ctx)
 	engine := &activeEngine{
-		siteID:    siteID,
-		devices:   slices.Clone(devices),
-		startedAt: time.Now().UTC(),
-		cancel:    cancel,
-		done:      make(chan error, 1),
+		organisationID: snapshot.control.organisationID.Int64,
+		siteID:         snapshot.control.siteID.Int64,
+		devices:        snapshot.devices,
+		startedAt:      time.Now().UTC(),
+		cancel:         cancel,
+		done:           make(chan error, 1),
 	}
 	go func() {
-		engine.done <- startGateway(engineCtx, devices, credentials)
+		engine.done <- startGateway(engineCtx, snapshot.devices, credentials)
 	}()
 	return engine
 }

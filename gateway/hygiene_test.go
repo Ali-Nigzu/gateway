@@ -28,6 +28,7 @@ func TestRuntimeSourcesContainNoLegacyCredentialOrSchemaDependency(t *testing.T)
 			"rtsp_config",
 			"capture_config",
 			"analysis_config",
+			"analysis_interval_minutes",
 			"bigquery_destination",
 			"gateway_last_seen_at",
 		} {

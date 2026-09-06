@@ -24,12 +24,25 @@ func TestPrepareIdentityForFinalRemovalKeepsOnlyMarkerAndHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	helper := filepath.Join(paths.workDirectory, "removal-helper")
+	packageFrame := filepath.Join(
+		paths.workDirectory,
+		"frame-packages",
+		"1",
+		"1",
+		"83",
+		"window",
+		"frame.jpg",
+	)
+	if err := os.MkdirAll(filepath.Dir(packageFrame), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	for path, contents := range map[string]string{
 		paths.gatewayID:      "gateway",
 		paths.privateKey:     "key",
 		paths.certificate:    "certificate",
 		paths.removalPending: removalMarkerContents,
 		helper:               "helper",
+		packageFrame:         "jpeg",
 		filepath.Join(paths.workDirectory, "stale-candidate"): "stale",
 	} {
 		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
@@ -52,6 +65,9 @@ func TestPrepareIdentityForFinalRemovalKeepsOnlyMarkerAndHelper(t *testing.T) {
 	}
 	if len(workEntries) != 1 || workEntries[0].Name() != filepath.Base(helper) {
 		t.Fatalf("work entries after preparation = %v", workEntries)
+	}
+	if _, err := os.Stat(packageFrame); !os.IsNotExist(err) {
+		t.Fatalf("frame-package cache survived terminal preparation: %v", err)
 	}
 }
 

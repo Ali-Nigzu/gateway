@@ -119,7 +119,7 @@ func (service *camOSWindowsService) Execute(
 
 func windowsServiceResult(exit controllerExit) (bool, uint32) {
 	switch exit {
-	case controllerExitRestarted, controllerExitUpdated, controllerExitRemoved:
+	case controllerExitLifecycleHandoff:
 		return false, 0
 	default:
 		return true, serviceExitControllerStopped

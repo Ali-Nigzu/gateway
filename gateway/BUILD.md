@@ -26,4 +26,4 @@ darwin-amd64
 linux-amd64
 ```
 
-Each binary contains BuildVersion 1, the bootstrap commissioning credential and the matching FFmpeg payload. After physical qualification, upload these exact files to Generic Artifact Registry repository `camos-gateway-prod`, package `gateway`, version `1`.
+Each binary contains BuildVersion 2, the bootstrap commissioning credential and the matching FFmpeg payload. After physical qualification, upload these exact files to Generic Artifact Registry repository `camos-gateway-prod`, package `gateway`, version `2`.

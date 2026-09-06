@@ -460,15 +460,3 @@ func saveNewCommissionHash(paths identityPaths, hash commissionHash) (bool, erro
 func saveGatewayCertificate(paths identityPaths, certificatePEM []byte) error {
 	return atomicWriteIdentityFile(paths, paths.certificate, certificatePEM, true)
 }
-
-func parseGatewayIDFromCertificate(encoded []byte) (uuid.UUID, error) {
-	certificate, err := parseCertificateChain(encoded)
-	if err != nil {
-		return uuid.Nil, err
-	}
-	gatewayID, err := uuid.Parse(certificate.Subject.CommonName)
-	if err != nil || gatewayID == uuid.Nil || certificate.Subject.CommonName != gatewayID.String() {
-		return uuid.Nil, errors.New("Gateway certificate identity is invalid")
-	}
-	return gatewayID, nil
-}

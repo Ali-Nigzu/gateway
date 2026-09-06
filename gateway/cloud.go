@@ -3,9 +3,7 @@ package main
 import (
 	"context"
 	"errors"
-	"io"
 	"net/http"
-	"strconv"
 	"sync"
 	"time"
 
@@ -14,58 +12,9 @@ import (
 )
 
 const (
-	gcsBucketName    = "camos-prod-0"
-	objectTimeLayout = "2006-01-02T15-04-05.000Z.jpg"
+	gcsBucketName               = "camos-prod-0"
+	framePackageUploadChunkSize = 1 << 20
 )
-
-type acceptedImage struct {
-	version    uint64
-	capturedAt time.Time
-	jpegBytes  []byte
-}
-
-type latestImageSlot struct {
-	mutex     sync.Mutex
-	version   uint64
-	latest    acceptedImage
-	hasLatest bool
-	wake      chan struct{}
-}
-
-func newLatestImageSlot() latestImageSlot {
-	return latestImageSlot{wake: make(chan struct{}, 1)}
-}
-
-func (slot *latestImageSlot) replace(capturedAt time.Time, jpegBytes []byte) {
-	slot.mutex.Lock()
-	slot.version++
-	slot.latest = acceptedImage{
-		version:    slot.version,
-		capturedAt: capturedAt,
-		jpegBytes:  jpegBytes,
-	}
-	slot.hasLatest = true
-	slot.mutex.Unlock()
-	select {
-	case slot.wake <- struct{}{}:
-	default:
-	}
-}
-
-func (slot *latestImageSlot) snapshot() (acceptedImage, bool) {
-	slot.mutex.Lock()
-	defer slot.mutex.Unlock()
-	return slot.latest, slot.hasLatest
-}
-
-func (slot *latestImageSlot) clear(version uint64) {
-	slot.mutex.Lock()
-	if slot.hasLatest && slot.latest.version == version {
-		slot.latest = acceptedImage{}
-		slot.hasLatest = false
-	}
-	slot.mutex.Unlock()
-}
 
 type runtimeFactState struct {
 	mutex             sync.Mutex
@@ -109,87 +58,35 @@ func (facts *runtimeFactState) snapshot() runtimeFactSnapshot {
 	}
 }
 
-func superviseDeviceUploader(
-	ctx context.Context,
-	client *storage.Client,
-	runtime *deviceRuntime,
-) {
-	for {
-		runDeviceUploaderSafely(ctx, client, runtime)
-		if ctx.Err() != nil || !waitContext(ctx, retryDelay) {
-			return
-		}
-	}
-}
-
-func runDeviceUploaderSafely(
-	ctx context.Context,
-	client *storage.Client,
-	runtime *deviceRuntime,
-) {
-	defer func() {
-		_ = recover()
-	}()
-	uploadDeviceImages(ctx, client, runtime)
-}
-
-func uploadDeviceImages(
-	ctx context.Context,
-	client *storage.Client,
-	runtime *deviceRuntime,
-) {
-	for {
-		image, ok := runtime.images.snapshot()
-		if !ok {
-			select {
-			case <-ctx.Done():
-				return
-			case <-runtime.images.wake:
-				continue
-			}
-		}
-		completedAt, err := uploadAcceptedImage(
-			ctx,
-			client,
-			runtime.config,
-			image,
-		)
-		if err == nil {
-			runtime.facts.observeUpload(completedAt)
-			runtime.images.clear(image.version)
-			continue
-		}
-		if !waitContext(ctx, retryDelay) {
-			return
-		}
-	}
-}
-
-func uploadAcceptedImage(
+func uploadFramePackage(
 	ctx context.Context,
 	client *storage.Client,
 	device deviceRecord,
-	image acceptedImage,
+	framePackage framePackageUpload,
 ) (time.Time, error) {
-	operationCtx, cancel := context.WithTimeout(ctx, cloudOperationTimeout)
-	defer cancel()
+	if client == nil {
+		return time.Time{}, errors.New("cloud client is unavailable")
+	}
+	object := client.
+		Bucket(gcsBucketName).
+		Object(framePackageObjectName(
+			device.organisationID,
+			device.siteID,
+			device.id,
+			framePackage.window,
+		)).
+		Retryer(storage.WithPolicy(storage.RetryNever))
+	writer := object.If(storage.Conditions{DoesNotExist: true}).NewWriter(ctx)
+	writer.ContentType = "application/x-tar"
+	writer.ChunkSize = framePackageUploadChunkSize
+	writer.ChunkTransferTimeout = cloudOperationTimeout
 
-	object := acceptedImageObject(client, device, image.capturedAt)
-	writer := object.If(storage.Conditions{DoesNotExist: true}).NewWriter(operationCtx)
-	writer.ContentType = "image/jpeg"
-	writer.ChunkSize = 0
-
-	written, writeErr := writer.Write(image.jpegBytes)
-	if writeErr != nil {
-		_ = writer.CloseWithError(writeErr)
-		if isPreconditionFailed(writeErr) {
+	if writeErr := writeFramePackageTar(writer, framePackage); writeErr != nil {
+		closeErr := writer.CloseWithError(writeErr)
+		if isPreconditionFailed(writeErr) || isPreconditionFailed(closeErr) {
 			return time.Now().UTC(), nil
 		}
 		return time.Time{}, writeErr
-	}
-	if written != len(image.jpegBytes) {
-		_ = writer.CloseWithError(io.ErrShortWrite)
-		return time.Time{}, io.ErrShortWrite
 	}
 	if err := writer.Close(); err != nil {
 		if isPreconditionFailed(err) {
@@ -198,34 +95,6 @@ func uploadAcceptedImage(
 		return time.Time{}, err
 	}
 	return time.Now().UTC(), nil
-}
-
-func acceptedImageObject(
-	client *storage.Client,
-	device deviceRecord,
-	capturedAt time.Time,
-) *storage.ObjectHandle {
-	return client.
-		Bucket(gcsBucketName).
-		Object(objectName(
-			device.organisationID,
-			device.siteID,
-			device.id,
-			capturedAt,
-		)).
-		Retryer(storage.WithPolicy(storage.RetryNever))
-}
-
-func objectName(
-	organisationID int64,
-	siteID int64,
-	deviceID int64,
-	timestamp time.Time,
-) string {
-	return strconv.FormatInt(organisationID, 10) + "/" +
-		strconv.FormatInt(siteID, 10) + "/" +
-		strconv.FormatInt(deviceID, 10) + "/" +
-		timestamp.UTC().Format(objectTimeLayout)
 }
 
 func isPreconditionFailed(err error) bool {
@@ -241,15 +110,11 @@ func superviseRuntimeFacts(
 ) {
 	arguments := make([]any, 4*len(runtimes))
 	for {
-		success := writeRuntimeFactsSafely(ctx, store, statement, arguments, runtimes)
+		writeRuntimeFactsSafely(ctx, store, statement, arguments, runtimes)
 		if ctx.Err() != nil {
 			return
 		}
-		delay := retryDelay
-		if success {
-			delay = runtimeFactInterval
-		}
-		if !waitContext(ctx, delay) {
+		if !waitContext(ctx, retryDelay) {
 			return
 		}
 	}
@@ -261,11 +126,9 @@ func writeRuntimeFactsSafely(
 	statement string,
 	arguments []any,
 	runtimes []*deviceRuntime,
-) (success bool) {
+) {
 	defer func() {
-		if recover() != nil {
-			success = false
-		}
+		_ = recover()
 	}()
 
 	for index, runtime := range runtimes {
@@ -278,6 +141,5 @@ func writeRuntimeFactsSafely(
 	}
 	operationCtx, cancel := context.WithTimeout(ctx, cloudOperationTimeout)
 	defer cancel()
-	err := store.writeRuntimeFacts(operationCtx, statement, arguments)
-	return err == nil
+	_ = store.writeRuntimeFacts(operationCtx, statement, arguments)
 }

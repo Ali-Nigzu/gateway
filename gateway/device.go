@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"image"
 	"image/jpeg"
 	"net/url"
@@ -25,15 +26,18 @@ type deviceRuntime struct {
 	currentComparison  *[comparisonCellCount]byte
 	baselineComparison *[comparisonCellCount]byte
 	hasBaseline        bool
-	images             latestImageSlot
+	packages           *framePackageCache
 	facts              runtimeFactState
 }
 
-func newDeviceRuntime(config deviceRecord) *deviceRuntime {
+func newDeviceRuntime(
+	config deviceRecord,
+	packages *framePackageCache,
+) *deviceRuntime {
 	runtime := &deviceRuntime{
 		config:   config,
 		rawFrame: make([]byte, rawFrameSize),
-		images:   newLatestImageSlot(),
+		packages: packages,
 	}
 	runtime.currentComparison = &runtime.comparisons[0]
 	runtime.baselineComparison = &runtime.comparisons[1]
@@ -116,7 +120,12 @@ func (runtime *deviceRuntime) processFrame(
 	if err != nil {
 		return err
 	}
-	runtime.images.replace(observedAt, jpegData)
+	if runtime.packages == nil {
+		return errors.New("frame package cache is unavailable")
+	}
+	if err := runtime.packages.addFrame(observedAt, jpegData); err != nil {
+		return err
+	}
 	runtime.baselineComparison, runtime.currentComparison =
 		runtime.currentComparison, runtime.baselineComparison
 	runtime.hasBaseline = true

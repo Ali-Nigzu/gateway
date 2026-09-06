@@ -145,16 +145,7 @@ func prepareWindowsLifecycleHelper(kind string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := prepareIdentityDirectory(paths); err != nil {
-		return "", err
-	}
-	if err := os.MkdirAll(paths.workDirectory, 0o700); err != nil {
-		return "", errors.New("lifecycle work directory creation failed")
-	}
-	if err := applyWindowsIdentityDACL(
-		paths.workDirectory,
-		windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-	); err != nil {
+	if err := prepareIdentityWorkDirectory(paths); err != nil {
 		return "", err
 	}
 	source, err := os.Executable()
