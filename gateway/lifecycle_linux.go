@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 const (
@@ -18,9 +20,6 @@ const (
 func beginGatewayRemoval() error {
 	if os.Geteuid() != 0 {
 		return errors.New("terminal Gateway removal must run as root")
-	}
-	if err := markGatewayRemovalPending(); err != nil {
-		return err
 	}
 	paths, err := resolveIdentityPaths()
 	if err != nil {
@@ -47,13 +46,33 @@ func beginGatewayRemoval() error {
 }
 
 func systemdRemovalUnit(helperPath string) string {
+	// systemd launches a stable OS executable rather than the transient Gateway
+	// copy directly. Once the validated helper has completed and unlinked itself,
+	// the shell can finish deleting identity/unit tombstones after a crash or
+	// reboot without depending on an executable it already removed.
+	finalizer := fmt.Sprintf(
+		"set -e; if [ -x %s ]; then %s internal-remove; fi; if [ -e %s ] || [ -L %s ]; then test -f %s; test ! -e %s; test ! -L %s; test ! -e %s; test ! -L %s; /bin/rm -rf -- %s; fi; /bin/rm -f -- %s; /bin/rm -f -- %s; /bin/rm -f -- %s; /bin/systemctl daemon-reload",
+		helperPath,
+		helperPath,
+		gatewayIdentityDirectory,
+		gatewayIdentityDirectory,
+		filepath.Join(gatewayIdentityDirectory, removalPendingFilename),
+		gatewayIdentityPath,
+		gatewayIdentityPath,
+		helperPath,
+		helperPath,
+		gatewayIdentityDirectory,
+		systemdRemovalUnitPath+".installing",
+		systemdRemovalUnitPath,
+		filepath.Join(filepath.Dir(systemdRemovalUnitPath), "multi-user.target.wants", systemdRemovalUnitName),
+	)
 	return fmt.Sprintf(`[Unit]
 Description=Complete camOS Gateway terminal removal
 After=local-fs.target
 
 [Service]
 Type=oneshot
-ExecStart=%s internal-remove
+ExecStart=/bin/sh -c %s
 Restart=on-failure
 RestartSec=5
 User=root
@@ -62,7 +81,7 @@ UMask=0077
 
 [Install]
 WantedBy=multi-user.target
-`, helperPath)
+`, quotePOSIXShellArgument(finalizer))
 }
 
 func handleInternalPlatformCommand(arguments []string) (bool, error) {
@@ -85,7 +104,7 @@ func runLinuxRemovalHelper() error {
 	}
 
 	// Disable first so Restart=always cannot recreate the permanent process.
-	if err := runSystemctl("disable", "--now", systemdGatewayUnitName); err != nil {
+	if err := disableSystemdUnitIdempotently(systemdGatewayUnitName, systemdGatewayUnitPath, true); err != nil {
 		return fmt.Errorf("Gateway systemd service disable failed: %w", err)
 	}
 	if err := removeFileIfPresent(systemdGatewayUnitPath + ".installing"); err != nil {
@@ -112,21 +131,90 @@ func runLinuxRemovalHelper() error {
 	if err := prepareIdentityForFinalRemoval(paths, helperPath); err != nil {
 		return err
 	}
-	if err := runSystemctl("disable", systemdRemovalUnitName); err != nil {
-		return fmt.Errorf("removal systemd unit disable failed: %w", err)
+	// GatewayID absence and helper absence together are the wrapper's narrow
+	// proof that the validating helper crossed its successful cleanup boundary.
+	// Either deletion may be retried after a crash; neither permits a stale
+	// native wrapper to delete a different, still-committed identity.
+	if err := deleteGatewayID(); err != nil {
+		return fmt.Errorf("GatewayID final removal failed: %w", err)
 	}
-	if err := removeFileIfPresent(systemdRemovalUnitPath + ".installing"); err != nil {
-		return fmt.Errorf("removal systemd temporary unit cleanup failed: %w", err)
+	if err := removeFileIfPresent(helperPath); err != nil {
+		return fmt.Errorf("removal helper unlink failed: %w", err)
 	}
-	if err := removeFileIfPresent(systemdRemovalUnitPath); err != nil {
-		return fmt.Errorf("removal systemd unit cleanup failed: %w", err)
+	return syncIdentityDirectory(paths.workDirectory)
+}
+
+func platformRemovalStatePresent() (bool, error) {
+	_, err := os.Lstat(systemdRemovalUnitPath)
+	if err == nil {
+		return true, nil
 	}
-	if err := syncParentDirectory(systemdRemovalUnitPath); err != nil {
-		return fmt.Errorf("removal systemd unit directory sync failed: %w", err)
+	if !errors.Is(err, os.ErrNotExist) {
+		return false, errors.New("terminal removal native state is unavailable")
 	}
-	if err := runSystemctl("daemon-reload"); err != nil {
-		return fmt.Errorf("final systemd reload failed: %w", err)
+	missing, err := systemdUnitLoadStateNotFound(systemdRemovalUnitName)
+	if err != nil {
+		return false, errors.New("terminal removal native state is unavailable")
 	}
-	// The helper and terminal marker are the final application files removed.
-	return removeExactDirectory(paths.directory, "/var/lib/camos-gateway")
+	// systemd retains an in-memory unit after its unit file is unlinked until a
+	// successful daemon-reload/garbage collection. That cached finalizer is still
+	// destructive authority and must block commissioning and normal startup.
+	return linuxRemovalNativeState(false, !missing, nil)
+}
+
+func linuxRemovalNativeState(filePresent, loaded bool, probeErr error) (bool, error) {
+	if filePresent {
+		return true, nil
+	}
+	if probeErr != nil {
+		return false, errors.New("terminal removal native state is unavailable")
+	}
+	return loaded, nil
+}
+
+func disableSystemdUnitIdempotently(unitName, unitPath string, stop bool) error {
+	arguments := []string{"disable"}
+	if stop {
+		arguments = append(arguments, "--now")
+	}
+	arguments = append(arguments, unitName)
+	if err := runSystemctl(arguments...); err == nil {
+		return nil
+	}
+	if _, statErr := os.Lstat(unitPath); statErr == nil {
+		return errors.New("systemd unit still exists after disable failure")
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return errors.New("systemd unit state is unavailable")
+	}
+	missing, err := systemdUnitLoadStateNotFound(unitName)
+	if err != nil || !missing {
+		return errors.New("systemd unit absence could not be verified")
+	}
+	return nil
+}
+
+func systemdUnitLoadStateNotFound(unitName string) (bool, error) {
+	command := exec.Command(
+		"/bin/systemctl",
+		"show",
+		"--property=LoadState",
+		"--value",
+		unitName,
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return false, err
+	}
+	return systemdLoadStateNotFound(strings.TrimSpace(string(output)))
+}
+
+func systemdLoadStateNotFound(state string) (bool, error) {
+	switch state {
+	case "not-found":
+		return true, nil
+	case "loaded", "masked", "bad-setting", "error", "merged":
+		return false, nil
+	default:
+		return false, errors.New("systemd returned an ambiguous unit load state")
+	}
 }

@@ -49,6 +49,23 @@ func installService() error {
 	if os.Geteuid() != 0 {
 		return errors.New("Gateway service installation must be run as root")
 	}
+	releaseLifecycle, err := acquireGatewayLifecycleLock(lifecycleOperationLockWait)
+	if err != nil {
+		return err
+	}
+	lockHeld := true
+	defer func() {
+		if lockHeld {
+			releaseLifecycle()
+		}
+	}()
+	identityPaths, err := resolveIdentityPaths()
+	if err != nil {
+		return err
+	}
+	if err := ensureCommissioningAllowed(identityPaths); err != nil {
+		return err
+	}
 	if err := validateEmbeddedRelease(); err != nil {
 		return err
 	}
@@ -83,6 +100,10 @@ func installService() error {
 	} else if err := runSystemctl("restart", systemdGatewayUnitName); err != nil {
 		return fmt.Errorf("systemd restart failed: %w", err)
 	}
+	// Type=simple makes the start request complete after exec. Release before
+	// waiting so the new process can take the same lock for startup recovery.
+	releaseLifecycle()
+	lockHeld = false
 	return waitForSystemdGatewayRunning()
 }
 

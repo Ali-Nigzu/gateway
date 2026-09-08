@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -15,12 +16,20 @@ const ffmpegExecutableName = "ffmpeg"
 func runService() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	pending, err := gatewayRemovalPending()
+	pending, err := posixRemovalPending()
 	if err != nil {
 		return err
 	}
 	if pending {
 		return beginGatewayRemoval()
+	}
+	gatewayID, err := loadGatewayID()
+	if err != nil {
+		return err
+	}
+	handoff, startupUpdateFailure := reconcileUpdateStateAtStartup(gatewayID)
+	if handoff {
+		return nil
 	}
 	if err := clearStaleFramePackageState(); err != nil {
 		return err
@@ -36,6 +45,9 @@ func runService() error {
 	if err != nil {
 		return err
 	}
+	if credentials.gatewayID != gatewayID {
+		return errors.New("GatewayID changed during runtime startup")
+	}
 
 	resume := make(chan struct{}, 1)
 	powerWatcher, err := startPowerResumeWatcher(resume)
@@ -44,6 +56,6 @@ func runService() error {
 	}
 	defer powerWatcher.stop()
 
-	runController(ctx, credentials, resume)
+	runController(ctx, credentials, resume, startupUpdateFailure)
 	return nil
 }

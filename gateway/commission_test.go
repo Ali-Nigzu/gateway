@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -115,5 +117,88 @@ func TestDefinitiveCommissionRejectionIsConservative(t *testing.T) {
 		if definitiveCommissionRejection(status) {
 			t.Fatalf("transient/auth status %d destroyed resumable state", status)
 		}
+	}
+}
+
+func TestCommissioningGuardRejectsEveryRemovalMarkerState(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		marker          []byte
+		markerDirectory bool
+	}{
+		{name: "valid v1", marker: mustRemovalMarker(t, testRemovalGatewayID)},
+		{name: "legacy", marker: []byte(legacyRemovalMarkerContents)},
+		{name: "different GatewayID", marker: mustRemovalMarker(t, testOtherRemovalGatewayID)},
+		{name: "malformed", marker: []byte("malformed\n")},
+		{name: "unreadable", markerDirectory: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			paths := newIdentityPaths(directory, filepath.Join(directory, "GatewayID"))
+			if test.markerDirectory {
+				if err := os.Mkdir(paths.removalPending, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(paths.removalPending, test.marker, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := ensureCommissioningAllowed(paths); err == nil {
+				t.Fatal("commissioning was allowed with terminal removal state")
+			}
+		})
+	}
+}
+
+func TestCommissioningGuardAllowsAbsentRemovalMarker(t *testing.T) {
+	directory := t.TempDir()
+	paths := newIdentityPaths(directory, filepath.Join(directory, "GatewayID"))
+	if err := ensureCommissioningAllowed(paths); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCommissionCompletionRefusesRemovalBeforeReportingSuccess(t *testing.T) {
+	directory := t.TempDir()
+	paths := newIdentityPaths(directory, filepath.Join(directory, "GatewayID"))
+	if err := os.WriteFile(
+		paths.removalPending,
+		mustRemovalMarker(t, testRemovalGatewayID),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForCommissionCompletion(
+		context.Background(),
+		paths,
+		hashCommissionID("commission-id"),
+		time.Millisecond,
+	); err == nil {
+		t.Fatal("completion succeeded while terminal removal was pending")
+	}
+}
+
+func TestCommissionCompletionStopsWhenRemovalAppears(t *testing.T) {
+	directory := t.TempDir()
+	paths := newIdentityPaths(directory, filepath.Join(directory, "GatewayID"))
+	expected := hashCommissionID("commission-id")
+	if err := os.WriteFile(paths.commissionHash, expected.encoded(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- waitForCommissionCompletion(ctx, paths, expected, time.Millisecond)
+	}()
+	if err := os.WriteFile(
+		paths.removalPending,
+		[]byte(legacyRemovalMarkerContents),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; err == nil {
+		t.Fatal("completion did not stop when terminal removal appeared")
 	}
 }

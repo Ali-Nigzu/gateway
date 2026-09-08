@@ -5,9 +5,11 @@ package main
 import (
 	"errors"
 	"fmt"
+	"html"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 const (
@@ -20,9 +22,6 @@ const (
 func beginGatewayRemoval() error {
 	if os.Geteuid() != 0 {
 		return errors.New("terminal Gateway removal must run as root")
-	}
-	if err := markGatewayRemovalPending(); err != nil {
-		return err
 	}
 	paths, err := resolveIdentityPaths()
 	if err != nil {
@@ -57,6 +56,26 @@ func beginGatewayRemoval() error {
 }
 
 func removalLaunchDaemonPropertyList(helperPath string) string {
+	// Use a stable OS executable as the final launchd program. The custom
+	// Gateway helper validates committed authority and performs sensitive
+	// cleanup first; after it succeeds and unlinks itself, this wrapper can
+	// idempotently finish deletion even on the next boot.
+	finalizer := fmt.Sprintf(
+		"set -e; if [ -x %s ]; then %s internal-remove; fi; if [ -e %s ] || [ -L %s ]; then test -f %s; test ! -e %s; test ! -L %s; test ! -e %s; test ! -L %s; /bin/rm -rf -- %s; fi; /bin/rm -f -- %s; /bin/rm -f -- %s; /bin/launchctl bootout %s",
+		quotePOSIXShellArgument(helperPath),
+		quotePOSIXShellArgument(helperPath),
+		quotePOSIXShellArgument(gatewayIdentityDirectory),
+		quotePOSIXShellArgument(gatewayIdentityDirectory),
+		quotePOSIXShellArgument(filepath.Join(gatewayIdentityDirectory, removalPendingFilename)),
+		quotePOSIXShellArgument(gatewayIdentityPath),
+		quotePOSIXShellArgument(gatewayIdentityPath),
+		quotePOSIXShellArgument(helperPath),
+		quotePOSIXShellArgument(helperPath),
+		quotePOSIXShellArgument(gatewayIdentityDirectory),
+		quotePOSIXShellArgument(removalLaunchDaemonPath+".installing"),
+		quotePOSIXShellArgument(removalLaunchDaemonPath),
+		quotePOSIXShellArgument(removalLaunchDaemonTarget),
+	)
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -65,8 +84,9 @@ func removalLaunchDaemonPropertyList(helperPath string) string {
     <string>%s</string>
     <key>ProgramArguments</key>
     <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
         <string>%s</string>
-        <string>internal-remove</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -78,20 +98,38 @@ func removalLaunchDaemonPropertyList(helperPath string) string {
     <integer>63</integer>
 </dict>
 </plist>
-`, removalLaunchDaemonLabel, helperPath)
+`, removalLaunchDaemonLabel, html.EscapeString(finalizer))
 }
 
 func launchDaemonTargetLoaded(target string) (bool, error) {
 	command := exec.Command("/bin/launchctl", "print", target)
-	_, err := command.CombinedOutput()
+	output, err := command.CombinedOutput()
 	if err == nil {
 		return true, nil
 	}
 	var exitError *exec.ExitError
-	if errors.As(err, &exitError) {
+	if errors.As(err, &exitError) && launchctlPrintProvesAbsent(string(output), target) {
 		return false, nil
 	}
-	return false, fmt.Errorf("LaunchDaemon state check failed: %w", err)
+	return false, errors.New("LaunchDaemon state check returned an ambiguous failure")
+}
+
+func launchctlPrintProvesAbsent(output, target string) bool {
+	normalized := strings.ToLower(strings.Join(strings.Fields(output), " "))
+	label := strings.ToLower(strings.TrimPrefix(target, "system/"))
+	if label == "" || strings.ContainsAny(label, " \t\r\n\"") {
+		return false
+	}
+	canonical := []string{
+		fmt.Sprintf("could not find service %s in domain for system", label),
+		fmt.Sprintf("could not find service \"%s\" in domain for system", label),
+	}
+	for _, message := range canonical {
+		if normalized == message || normalized == "bad request. "+message {
+			return true
+		}
+	}
+	return false
 }
 
 func handleInternalPlatformCommand(arguments []string) (bool, error) {
@@ -143,26 +181,43 @@ func runDarwinRemovalHelper() error {
 	if err := prepareIdentityForFinalRemoval(paths, helperPath); err != nil {
 		return err
 	}
-	// Keep the supervised helper and durable marker until every fallible
-	// permanent-file and LaunchDaemon cleanup step has completed.
-	if err := removeFileIfPresent(removalLaunchDaemonPath + ".installing"); err != nil {
-		return fmt.Errorf("removal LaunchDaemon temporary definition cleanup failed: %w", err)
+	// GatewayID absence and helper absence together are the wrapper's narrow
+	// proof that the validating helper crossed its successful cleanup boundary.
+	// Either deletion may be retried after a crash; neither permits a stale
+	// native wrapper to delete a different, still-committed identity.
+	if err := deleteGatewayID(); err != nil {
+		return fmt.Errorf("GatewayID final removal failed: %w", err)
 	}
-	if err := removeFileIfPresent(removalLaunchDaemonPath); err != nil {
-		return fmt.Errorf("removal LaunchDaemon definition cleanup failed: %w", err)
+	if err := removeFileIfPresent(helperPath); err != nil {
+		return fmt.Errorf("removal helper unlink failed: %w", err)
 	}
-	if err := syncParentDirectory(removalLaunchDaemonPath); err != nil {
-		return fmt.Errorf("removal LaunchDaemon directory sync failed: %w", err)
-	}
-	if err := removeExactDirectory(paths.directory, gatewayIdentityDirectory); err != nil {
-		return fmt.Errorf("Gateway identity removal failed: %w", err)
-	}
+	return syncIdentityDirectory(paths.workDirectory)
+}
 
-	// bootout terminates this final transient job. At this point its plist,
-	// executable, marker, permanent service, identity and installation are gone.
-	command := exec.Command("/bin/launchctl", "bootout", removalLaunchDaemonTarget)
-	if err := command.Start(); err != nil {
-		return fmt.Errorf("removal LaunchDaemon unload failed: %w", err)
+func platformRemovalStatePresent() (bool, error) {
+	_, err := os.Lstat(removalLaunchDaemonPath)
+	if err == nil {
+		return true, nil
 	}
-	return nil
+	if !errors.Is(err, os.ErrNotExist) {
+		return false, errors.New("terminal removal native state is unavailable")
+	}
+	loaded, err := launchDaemonTargetLoaded(removalLaunchDaemonTarget)
+	if err != nil {
+		return false, errors.New("terminal removal native state is unavailable")
+	}
+	// launchd retains the loaded job and its cached shell finalizer after the
+	// plist is unlinked. Treat that in-memory job as committed native authority
+	// until launchctl proves it absent, or it could delete a new commission.
+	return darwinRemovalNativeState(false, loaded, nil)
+}
+
+func darwinRemovalNativeState(filePresent, loaded bool, probeErr error) (bool, error) {
+	if filePresent {
+		return true, nil
+	}
+	if probeErr != nil {
+		return false, errors.New("terminal removal native state is unavailable")
+	}
+	return loaded, nil
 }

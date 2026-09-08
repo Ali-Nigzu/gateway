@@ -89,6 +89,9 @@ func commission(rawCommissionID string) error {
 			string(publicKeyPEM),
 			retryDelay,
 		)
+		if removalErr := ensureCommissioningAllowed(prepared.paths); removalErr != nil {
+			return removalErr
+		}
 		if err != nil {
 			var httpError *commissionHTTPError
 			if errors.As(err, &httpError) && httpError.definitiveInvalidID {
@@ -122,12 +125,18 @@ func commission(rawCommissionID string) error {
 		if err := proveRuntimeIdentity(ctx, gatewayID, prepared.paths.certificateConfig); err != nil {
 			return err
 		}
+		if err := ensureCommissioningAllowed(prepared.paths); err != nil {
+			return err
+		}
 		// GatewayID is deliberately the final durable identity commit marker.
 		if err := saveGatewayID(gatewayID); err != nil {
 			return err
 		}
 	}
 
+	if err := ensureCommissioningAllowed(prepared.paths); err != nil {
+		return err
+	}
 	if err := installService(); err != nil {
 		return err
 	}
@@ -148,7 +157,13 @@ func prepareCommission(rawCommissionID string, now time.Time) (preparedCommissio
 	if err != nil {
 		return preparedCommission{}, err
 	}
+	if err := ensureCommissioningAllowed(paths); err != nil {
+		return preparedCommission{}, err
+	}
 	if err := prepareIdentityDirectory(paths); err != nil {
+		return preparedCommission{}, err
+	}
+	if err := ensureCommissioningAllowed(paths); err != nil {
 		return preparedCommission{}, err
 	}
 	expectedHash := hashCommissionID(rawCommissionID)
@@ -171,6 +186,9 @@ func prepareCommission(rawCommissionID string, now time.Time) (preparedCommissio
 		}
 		if !pending.matches(expectedHash) {
 			return preparedCommission{}, errors.New("a different commissioning attempt is incomplete")
+		}
+		if err := ensureCommissioningAllowed(paths); err != nil {
+			return preparedCommission{}, err
 		}
 		return preparedCommission{
 			paths:      paths,
@@ -227,11 +245,32 @@ func prepareCommission(rawCommissionID string, now time.Time) (preparedCommissio
 			}
 		}
 	}
+	if err := ensureCommissioningAllowed(paths); err != nil {
+		return preparedCommission{}, err
+	}
 	return preparedCommission{
 		paths:      paths,
 		hash:       expectedHash,
 		privateKey: privateKey,
 	}, nil
+}
+
+func ensureCommissioningAllowed(paths identityPaths) error {
+	nativePending, nativeErr := platformRemovalStatePresent()
+	if nativeErr != nil {
+		return nativeErr
+	}
+	if nativePending {
+		return errors.New("Gateway terminal removal is pending")
+	}
+	_, err := os.Lstat(paths.removalPending)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return errors.New("terminal removal state is unavailable")
+	}
+	return errors.New("Gateway terminal removal is pending")
 }
 
 func removeUncommittedCredentialFiles(paths identityPaths) error {
@@ -365,6 +404,9 @@ func waitForCommissionCompletion(
 	pollInterval time.Duration,
 ) error {
 	for {
+		if err := ensureCommissioningAllowed(paths); err != nil {
+			return err
+		}
 		encoded, err := os.ReadFile(paths.commissionHash)
 		if errors.Is(err, os.ErrNotExist) {
 			return nil

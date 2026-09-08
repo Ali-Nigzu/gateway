@@ -16,6 +16,7 @@ import (
 
 const (
 	registryPath           = `SOFTWARE\camOS\Gateway`
+	registryParentPath     = `SOFTWARE\camOS`
 	registryGatewayIDValue = "GatewayID"
 	legacySiteIDValue      = "SiteID"
 
@@ -142,15 +143,11 @@ func publishIdentityFile(sourcePath, targetPath string, replace bool) (bool, err
 	if err != nil {
 		return false, errors.New("identity state path is invalid")
 	}
+	flags := uint32(windows.MOVEFILE_WRITE_THROUGH)
 	if replace {
-		err = windows.MoveFileEx(
-			source,
-			target,
-			windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH,
-		)
-	} else {
-		err = windows.MoveFile(source, target)
+		flags |= windows.MOVEFILE_REPLACE_EXISTING
 	}
+	err = windows.MoveFileEx(source, target, flags)
 	if !replace && (errors.Is(err, windows.ERROR_ALREADY_EXISTS) ||
 		errors.Is(err, windows.ERROR_FILE_EXISTS)) {
 		return false, nil
@@ -237,8 +234,11 @@ func readStoredGatewayID() (string, bool, error) {
 	defer key.Close()
 
 	value, _, err := key.GetStringValue(registryGatewayIDValue)
-	if errors.Is(err, registry.ErrNotExist) || errors.Is(err, registry.ErrUnexpectedType) {
+	if errors.Is(err, registry.ErrNotExist) {
 		return "", false, nil
+	}
+	if errors.Is(err, registry.ErrUnexpectedType) {
+		return "", false, errors.New("GatewayID registry value has an invalid type")
 	}
 	if err != nil {
 		return "", false, err
@@ -248,11 +248,26 @@ func readStoredGatewayID() (string, bool, error) {
 
 func deleteGatewayID() error {
 	err := registry.DeleteKey(registry.LOCAL_MACHINE, registryPath)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return errors.New("GatewayID removal failed")
+	}
+	// Flush the parent even on an idempotent retry that observes absence. A
+	// previous delete may have become visible before its durability was known.
+	parent, err := registry.OpenKey(
+		registry.LOCAL_MACHINE,
+		registryParentPath,
+		registry.QUERY_VALUE|registry.WOW64_64KEY,
+	)
 	if errors.Is(err, registry.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
-		return errors.New("GatewayID removal failed")
+		return errors.New("GatewayID removal flush failed")
+	}
+	defer parent.Close()
+	status, _, _ := procRegFlushKey.Call(uintptr(parent))
+	if status != 0 {
+		return fmt.Errorf("GatewayID removal flush failed: %w", syscall.Errno(status))
 	}
 	return nil
 }

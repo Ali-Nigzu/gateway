@@ -27,10 +27,20 @@ const (
 	certificateConfigName    = "certificate-config.json"
 	commissionHashFilename   = "commission-hash"
 	removalPendingFilename   = "removal.pending"
+	updatePendingFilename    = "update.pending"
+	lifecycleStatusFilename  = "lifecycle.status"
 	identityWorkDirectory    = "work"
 	minimumCertificatePeriod = 364 * 24 * time.Hour
 	maximumCertificatePeriod = 366 * 24 * time.Hour
 	certificateRenewalWindow = 30 * 24 * time.Hour
+)
+
+// errIdentityPublishedDurabilityUnknown is returned only after the target
+// pathname has been atomically published and its durability cannot be proven.
+// A create-only commit caller may recover only by re-reading the exact record
+// through a path that successfully resynchronizes and revalidates the entry.
+var errIdentityPublishedDurabilityUnknown = errors.New(
+	"identity state was published but its directory sync failed",
 )
 
 type identityPaths struct {
@@ -41,6 +51,8 @@ type identityPaths struct {
 	certificateConfig string
 	commissionHash    string
 	removalPending    string
+	updatePending     string
+	lifecycleStatus   string
 	workDirectory     string
 }
 
@@ -53,6 +65,8 @@ func newIdentityPaths(directory, gatewayIDPath string) identityPaths {
 		certificateConfig: filepath.Join(directory, certificateConfigName),
 		commissionHash:    filepath.Join(directory, commissionHashFilename),
 		removalPending:    filepath.Join(directory, removalPendingFilename),
+		updatePending:     filepath.Join(directory, updatePendingFilename),
+		lifecycleStatus:   filepath.Join(directory, lifecycleStatusFilename),
 		workDirectory:     filepath.Join(directory, identityWorkDirectory),
 	}
 }
@@ -412,7 +426,36 @@ func atomicWriteIdentityFile(
 		return os.ErrExist
 	}
 	keepTemporary = false
-	return syncIdentityDirectory(paths.directory)
+	if err := requireDurableIdentityEntry(paths.directory, targetPath, nil); err != nil {
+		return fmt.Errorf("%w: %v", errIdentityPublishedDurabilityUnknown, err)
+	}
+	return nil
+}
+
+// requireDurableIdentityEntry makes a pathname usable as commit authority only
+// after the containing directory is synchronized and the expected regular-file
+// entry is still the one published/read. Windows publication supplies the
+// durability guarantee through MOVEFILE_WRITE_THROUGH; its directory sync is a
+// no-op, while the same pathname validation still applies.
+func requireDurableIdentityEntry(
+	directory string,
+	targetPath string,
+	expected os.FileInfo,
+) error {
+	if filepath.Clean(filepath.Dir(targetPath)) != filepath.Clean(directory) {
+		return errors.New("identity state path is outside the identity directory")
+	}
+	if err := syncIdentityDirectory(directory); err != nil {
+		return err
+	}
+	actual, err := os.Lstat(targetPath)
+	if err != nil || !actual.Mode().IsRegular() {
+		return errors.New("published identity state is unavailable")
+	}
+	if expected != nil && !os.SameFile(expected, actual) {
+		return errors.New("published identity state changed during inspection")
+	}
+	return nil
 }
 
 func removeUncommittedIdentity(paths identityPaths) error {

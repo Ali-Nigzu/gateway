@@ -22,7 +22,7 @@ const (
 	serviceExitControllerStopped    = 5
 	serviceExitEmbeddedPayload      = 6
 	serviceExitRuntimeIdentity      = 7
-	serviceExitRemovalRequested     = 8
+	serviceExitLifecycleHandoff     = 8
 )
 
 type camOSWindowsService struct {
@@ -43,6 +43,32 @@ func (service *camOSWindowsService) Execute(
 		WaitHint: 30_000,
 	}
 
+	// Committed local removal outranks every optional runtime dependency,
+	// including the FFmpeg process job. A job-object failure must never prevent
+	// deletion continuation from being attempted.
+	removalPending, err := windowsRemovalAuthorized()
+	if err != nil {
+		return true, serviceExitRuntimeIdentity
+	}
+	if removalPending {
+		if err := beginGatewayRemoval(); err != nil {
+			return true, serviceExitLifecycleHandoff
+		}
+		// The transient helper has synchronously acknowledged readiness and waits
+		// for this service process to exit. Report an orderly stop so SCM does not
+		// queue a concurrent 30-second recovery restart while that helper removes
+		// the package. The helper explicitly restarts this service on any failure.
+		return windowsServiceResultForHandoff(controllerExitLifecycleHandoff, true)
+	}
+	gatewayID, err := loadGatewayID()
+	if err != nil {
+		return true, serviceExitGatewayIDUnavailable
+	}
+	handoff, startupUpdateFailure := reconcileUpdateStateAtStartup(gatewayID)
+	if handoff {
+		return windowsServiceResult(controllerExitLifecycleHandoff)
+	}
+
 	processJob, exitCode := createProcessLifetimeJob()
 	if exitCode != 0 {
 		return true, exitCode
@@ -52,16 +78,6 @@ func (service *camOSWindowsService) Execute(
 	// terminate the service itself together with any remaining FFmpeg children.
 	service.processJob = processJob
 
-	removalPending, err := gatewayRemovalPending()
-	if err != nil {
-		return true, serviceExitRuntimeIdentity
-	}
-	if removalPending {
-		if err := beginGatewayRemoval(); err != nil {
-			return true, serviceExitRemovalRequested
-		}
-		return false, 0
-	}
 	if err := clearStaleFramePackageState(); err != nil {
 		return true, serviceExitRuntimeIdentity
 	}
@@ -76,10 +92,14 @@ func (service *camOSWindowsService) Execute(
 		cancel()
 		return true, serviceExitRuntimeIdentity
 	}
+	if credentials.gatewayID != gatewayID {
+		cancel()
+		return true, serviceExitRuntimeIdentity
+	}
 	resume := make(chan struct{}, 1)
 	controllerDone := make(chan controllerExit, 1)
 	go func() {
-		controllerDone <- runController(ctx, credentials, resume)
+		controllerDone <- runController(ctx, credentials, resume, startupUpdateFailure)
 	}()
 
 	runningStatus := svc.Status{
@@ -115,6 +135,15 @@ func (service *camOSWindowsService) Execute(
 
 		case exit := <-controllerDone:
 			cancel()
+			if exit == controllerExitLifecycleHandoff {
+				removalPending, removalErr := windowsRemovalAuthorized()
+				if removalErr == nil && removalPending {
+					// As above, a committed removal with an acknowledged helper is
+					// an orderly ownership transfer, not a service failure. Update
+					// and restart handoffs still use SCM recovery below.
+					return windowsServiceResultForHandoff(exit, true)
+				}
+			}
 			return windowsServiceResult(exit)
 		}
 	}
@@ -123,10 +152,23 @@ func (service *camOSWindowsService) Execute(
 func windowsServiceResult(exit controllerExit) (bool, uint32) {
 	switch exit {
 	case controllerExitLifecycleHandoff:
-		return false, 0
+		// Non-crash recovery is configured by the installer. A recoverable
+		// nonzero result protects the small window after a transient helper has
+		// acknowledged readiness but before it completes the lifecycle action.
+		return true, serviceExitLifecycleHandoff
 	default:
 		return true, serviceExitControllerStopped
 	}
+}
+
+func windowsServiceResultForHandoff(
+	exit controllerExit,
+	removalAuthorized bool,
+) (bool, uint32) {
+	if exit == controllerExitLifecycleHandoff && removalAuthorized {
+		return false, 0
+	}
+	return windowsServiceResult(exit)
 }
 
 func createProcessLifetimeJob() (windows.Handle, uint32) {

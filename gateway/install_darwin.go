@@ -52,6 +52,23 @@ func installService() error {
 	if os.Geteuid() != 0 {
 		return errors.New("Gateway service installation must be run as root")
 	}
+	releaseLifecycle, err := acquireGatewayLifecycleLock(lifecycleOperationLockWait)
+	if err != nil {
+		return err
+	}
+	lockHeld := true
+	defer func() {
+		if lockHeld {
+			releaseLifecycle()
+		}
+	}()
+	identityPaths, err := resolveIdentityPaths()
+	if err != nil {
+		return err
+	}
+	if err := ensureCommissioningAllowed(identityPaths); err != nil {
+		return err
+	}
 	if err := validateEmbeddedRelease(); err != nil {
 		return err
 	}
@@ -96,6 +113,10 @@ func installService() error {
 	if err := runLaunchctl("kickstart", launchDaemonTarget); err != nil {
 		return fmt.Errorf("LaunchDaemon start failed: %w", err)
 	}
+	// kickstart has handed launchd the start request. Release before the explicit
+	// running-state wait so the new process can perform startup reconciliation.
+	releaseLifecycle()
+	lockHeld = false
 	return waitForLaunchDaemonRunning()
 }
 
@@ -139,16 +160,7 @@ func secureLaunchDaemonPropertyList() error {
 }
 
 func launchDaemonLoaded() (bool, error) {
-	command := exec.Command("/bin/launchctl", "print", launchDaemonTarget)
-	_, err := command.CombinedOutput()
-	if err == nil {
-		return true, nil
-	}
-	var exitError *exec.ExitError
-	if errors.As(err, &exitError) {
-		return false, nil
-	}
-	return false, fmt.Errorf("LaunchDaemon state check failed: %w", err)
+	return launchDaemonTargetLoaded(launchDaemonTarget)
 }
 
 func waitForLaunchDaemonRunning() error {
