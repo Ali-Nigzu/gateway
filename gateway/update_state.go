@@ -874,17 +874,19 @@ func cleanupConfirmedUpdateState(
 	candidatePath string,
 	previousPath string,
 ) error {
+	// Confirmation has already proven and durably reported the candidate.
+	// Remove the transition authority before any fallible stale-byte cleanup:
+	// if a later removal fails, startup sees no pending transition and can
+	// safely retry deterministic cleanup. The inverse order could strand a
+	// pending rollback record after its only previous image was already gone.
+	if err := removeUpdatePending(paths); err != nil {
+		return err
+	}
 	if err := os.Remove(previousPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return errors.New("pending update previous executable removal failed")
 	}
 	if err := syncParentDirectory(previousPath); err != nil {
 		return errors.New("pending update previous executable cleanup sync failed")
-	}
-	// The rollback image is gone only after the confirmed candidate has been
-	// durably reported. Remove pending immediately after that boundary so a
-	// later best-effort stale-path cleanup cannot strand false rollback authority.
-	if err := removeUpdatePending(paths); err != nil {
-		return err
 	}
 	stalePaths := []string{previousPath + ".preparing"}
 	if candidatePath != "" {

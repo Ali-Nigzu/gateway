@@ -285,6 +285,29 @@ func TestSuccessfulConfirmationCleanupRemovesPendingAndExecutableState(t *testin
 	}
 }
 
+func TestConfirmationClearsPendingBeforeFallibleRecoveryCleanup(t *testing.T) {
+	identityDirectory := t.TempDir()
+	packageDirectory := t.TempDir()
+	paths := newIdentityPaths(identityDirectory, filepath.Join(identityDirectory, "GatewayID"))
+	if err := os.WriteFile(paths.updatePending, []byte("confirmed-transition"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previous := filepath.Join(packageDirectory, "camos-gateway.previous")
+	if err := os.Mkdir(previous, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(previous, "blocks-removal"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cleanupConfirmedUpdateState(paths, "", previous); err == nil {
+		t.Fatal("fallible previous-image cleanup unexpectedly succeeded")
+	}
+	if _, err := os.Lstat(paths.updatePending); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("confirmed pending authority survived fallible stale cleanup: %v", err)
+	}
+}
+
 func TestRollbackUsesValidatedPreviousAndExplicitReplacementOutcome(t *testing.T) {
 	directory := t.TempDir()
 	previous := filepath.Join(directory, "camos-gateway.previous")
