@@ -44,6 +44,10 @@ func requireCommissionPrivileges() error {
 	return nil
 }
 
+func createIdentityDirectory(paths identityPaths) error {
+	return prepareIdentityDirectory(paths)
+}
+
 func prepareIdentityDirectory(paths identityPaths) error {
 	if err := os.MkdirAll(paths.directory, 0o700); err != nil {
 		return errors.New("Gateway identity directory creation failed")

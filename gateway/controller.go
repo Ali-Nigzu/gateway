@@ -153,6 +153,13 @@ func (controller *controllerRuntime) runCycle(
 		controller.removalCommitted = true
 		return controller.continueCommittedRemoval()
 	}
+	// A process that outlived terminal removal must never adopt a replacement
+	// commission through the canonical path. Park it before any cloud, update,
+	// renewal, or camera work unless its startup identity generation is exact.
+	if err := validateRuntimeIdentityGeneration(controller.credentials); err != nil {
+		controller.park()
+		return false
+	}
 	control, err := controller.pollGatewayControl(ctx)
 	if err != nil {
 		if controller.startupUpdateFailure != nil {
@@ -170,7 +177,8 @@ func (controller *controllerRuntime) runCycle(
 		if controller.reconcileCertificateLifecycle(ctx) {
 			return true
 		}
-		if forceRestart && controller.runnable != nil {
+		if forceRestart && controller.runnable != nil &&
+			validateRuntimeIdentityGeneration(controller.credentials) == nil {
 			controller.reconcileEngine(ctx, controller.runnable, true)
 		}
 		return false
@@ -204,7 +212,7 @@ func (controller *controllerRuntime) runCycle(
 		)
 		return false
 	}
-	completePendingCommission(ctx, controller.store, controller.credentials.gatewayID)
+	completePendingCommission(ctx, controller.store, controller.credentials)
 
 	if controlPriorityFor(control) == controlPriorityUpdate {
 		revalidated, finished := controller.reconcileGatewayVersion(ctx, control)
@@ -247,6 +255,10 @@ func (controller *controllerRuntime) runCycle(
 		controller.preserveOnlyMatchingRoute(control)
 		return false
 	}
+	if err := validateRuntimeIdentityGeneration(controller.credentials); err != nil {
+		controller.park()
+		return false
+	}
 	controller.runnable = snapshot
 	controller.reconcileEngine(ctx, snapshot, forceRestart)
 	return false
@@ -275,6 +287,10 @@ func (controller *controllerRuntime) beginRemoval(
 		return false
 	}
 	defer release()
+	if err := validateRuntimeIdentityGeneration(controller.credentials); err != nil {
+		controller.park()
+		return false
+	}
 	if pending, pendingErr := gatewayRemovalPending(); pendingErr != nil {
 		controller.park()
 		_ = writeLifecycleStatus(lifecycleStatusTerminalRemoval, BuildVersion, pendingErr.Error())
@@ -467,6 +483,16 @@ func (controller *controllerRuntime) reconcileGatewayVersion(
 		return nil, false
 	}
 	defer release()
+	if err := validateRuntimeIdentityGeneration(controller.credentials); err != nil {
+		controller.startupUpdateFailure = err
+		controller.park()
+		controller.recordUpdateFailure(
+			original.desiredVersion,
+			lifecycleStatusReplacement,
+			err,
+		)
+		return nil, false
+	}
 	removalPending, err := gatewayRemovalPending()
 	if err != nil {
 		controller.startupUpdateFailure = err
@@ -586,24 +612,63 @@ func (controller *controllerRuntime) abortPreparedUpdateLocked(
 	controller.recordUpdateFailure(target, category, operationErr)
 }
 
-func completePendingCommission(ctx context.Context, store *postgresStore, gatewayID uuid.UUID) {
-	pending, err := pendingCommissionHash()
-	if err != nil || pending == nil || store == nil {
+func completePendingCommission(
+	ctx context.Context,
+	store *postgresStore,
+	credentials *runtimeCredentials,
+) {
+	if store == nil || credentials == nil {
+		return
+	}
+	// Snapshot the pending hash only while the running process still owns the
+	// startup identity generation. The cloud calls remain outside the lock.
+	release, err := acquireGatewayLifecycleLock(lifecycleOperationLockWait)
+	if err != nil {
+		return
+	}
+	if err := validateRuntimeIdentityGeneration(credentials); err != nil {
+		release()
+		return
+	}
+	paths, err := resolveIdentityPaths()
+	if err != nil {
+		release()
+		return
+	}
+	pending, err := loadPendingCommissionHash(paths)
+	release()
+	if err != nil || pending == nil {
 		return
 	}
 	operationCtx, cancel := context.WithTimeout(ctx, cloudOperationTimeout)
-	cleared, err := store.clearCommissionHash(operationCtx, gatewayID, pending[:])
+	cleared, err := store.clearCommissionHash(operationCtx, credentials.gatewayID, pending[:])
 	cancel()
 	if err != nil {
 		return
 	}
 	if !cleared {
 		operationCtx, cancel = context.WithTimeout(ctx, cloudOperationTimeout)
-		hash, exists, readErr := store.readCommissionHash(operationCtx, gatewayID)
+		hash, exists, readErr := store.readCommissionHash(operationCtx, credentials.gatewayID)
 		cancel()
 		if readErr != nil || !exists || hash != nil {
 			return
 		}
+	}
+	// The result authorizes deletion only from that exact same local generation.
+	release, err = acquireGatewayLifecycleLock(lifecycleOperationLockWait)
+	if err != nil {
+		return
+	}
+	defer release()
+	if err := validateRuntimeIdentityGeneration(credentials); err != nil {
+		return
+	}
+	if removalPending, removalErr := gatewayRemovalPending(); removalErr != nil || removalPending {
+		return
+	}
+	current, err := loadPendingCommissionHash(paths)
+	if err != nil || current == nil || !current.matches(*pending) {
+		return
 	}
 	_ = removePendingCommissionHash()
 }

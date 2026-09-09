@@ -49,6 +49,39 @@ func TestBootstrapCredentialValidationRequiresExactIdentity(t *testing.T) {
 	}
 }
 
+func TestRuntimeIdentityFenceRejectsReplacementGeneration(t *testing.T) {
+	parent := t.TempDir()
+	directory := filepath.Join(parent, "identity")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	paths := newIdentityPaths(directory, filepath.Join(directory, "GatewayID"))
+	gatewayID := uuid.MustParse("1d91378f-7b96-4e6f-95b2-1304b728d28f")
+	if err := os.WriteFile(paths.gatewayID, []byte(gatewayID.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := captureIdentityDirectoryGeneration(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readID := func() (uuid.UUID, error) { return readRemovalGatewayID(paths.gatewayID) }
+	if err := validateBoundIdentityGeneration(generation, gatewayID, paths, readID); err != nil {
+		t.Fatalf("current runtime identity generation was rejected: %v", err)
+	}
+	if err := os.Rename(directory, directory+".retired"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.gatewayID, []byte(gatewayID.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateBoundIdentityGeneration(generation, gatewayID, paths, readID); err == nil {
+		t.Fatal("replacement directory with the same GatewayID passed the runtime identity fence")
+	}
+}
+
 func TestRuntimeWIFOptionsAreExact(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), certificateConfigName)
 	options := runtimeWIFOptions(

@@ -87,3 +87,46 @@ func TestRenewalRequestUsesLockedWireContract(t *testing.T) {
 		t.Fatalf("renewal response = %#v, %v", response, err)
 	}
 }
+
+func TestRenewalCommitRequiresUnchangedGatewayIdentity(t *testing.T) {
+	privateKey, err := generateGatewayPrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPrivateKey, err := generateGatewayPrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gatewayID := uuid.MustParse("1d91378f-7b96-4e6f-95b2-1304b728d28f")
+	expected := gatewayIdentity{
+		gatewayID:      gatewayID,
+		privateKey:     privateKey,
+		certificatePEM: []byte("current-certificate"),
+	}
+	if !sameGatewayIdentity(expected, expected) {
+		t.Fatal("unchanged renewal identity was rejected")
+	}
+	for name, changed := range map[string]gatewayIdentity{
+		"GatewayID": {
+			gatewayID:      uuid.MustParse("673fa485-1838-46a8-b283-29d109260ca6"),
+			privateKey:     privateKey,
+			certificatePEM: expected.certificatePEM,
+		},
+		"private key": {
+			gatewayID:      gatewayID,
+			privateKey:     otherPrivateKey,
+			certificatePEM: expected.certificatePEM,
+		},
+		"certificate": {
+			gatewayID:      gatewayID,
+			privateKey:     privateKey,
+			certificatePEM: []byte("replacement-current-certificate"),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if sameGatewayIdentity(expected, changed) {
+				t.Fatal("changed renewal identity was accepted")
+			}
+		})
+	}
+}

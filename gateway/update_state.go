@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -19,6 +20,7 @@ import (
 const (
 	updatePendingHeader        = "camos-gateway-update-pending-v1"
 	updatePendingMaximumBytes  = 1024
+	maximumCandidateStarts     = 2
 	lifecycleStatusHeader      = "camos-gateway-lifecycle-status-v1"
 	lifecycleStatusMaxDetail   = 240
 	lifecycleOperationLockWait = 30 * time.Second
@@ -31,6 +33,7 @@ type updatePendingRecord struct {
 	activeSHA256    [sha256.Size]byte
 	candidateSHA256 [sha256.Size]byte
 	target          string
+	candidateStarts uint8
 }
 
 type updateStartupAction uint8
@@ -111,12 +114,15 @@ func marshalUpdatePending(record updatePendingRecord) ([]byte, error) {
 		record.fromVersion == record.toVersion {
 		return nil, errors.New("pending update record is invalid")
 	}
+	if record.candidateStarts > maximumCandidateStarts {
+		return nil, errors.New("pending update candidate start count is invalid")
+	}
 	expectedTarget, err := artifactPlatformFilenameForTarget(record.target)
 	if err != nil || expectedTarget != record.target {
 		return nil, errors.New("pending update target is invalid")
 	}
 	encoded := fmt.Sprintf(
-		"%s\ngateway_id=%s\nfrom_version=%s\nto_version=%s\nactive_sha256=%s\ncandidate_sha256=%s\ntarget=%s\n",
+		"%s\ngateway_id=%s\nfrom_version=%s\nto_version=%s\nactive_sha256=%s\ncandidate_sha256=%s\ntarget=%s\ncandidate_starts=%d\n",
 		updatePendingHeader,
 		record.gatewayID.String(),
 		record.fromVersion,
@@ -124,6 +130,7 @@ func marshalUpdatePending(record updatePendingRecord) ([]byte, error) {
 		hex.EncodeToString(record.activeSHA256[:]),
 		hex.EncodeToString(record.candidateSHA256[:]),
 		record.target,
+		record.candidateStarts,
 	)
 	if len(encoded) > updatePendingMaximumBytes {
 		return nil, errors.New("pending update record is too large")
@@ -138,13 +145,13 @@ func parseUpdatePending(encoded []byte) (updatePendingRecord, error) {
 		return record, errors.New("pending update record is invalid")
 	}
 	lines := strings.Split(string(encoded), "\n")
-	if len(lines) != 8 || lines[0] != updatePendingHeader || lines[7] != "" {
+	if len(lines) != 9 || lines[0] != updatePendingHeader || lines[8] != "" {
 		return record, errors.New("pending update record is invalid")
 	}
-	values := make([]string, 6)
+	values := make([]string, 7)
 	keys := []string{
 		"gateway_id=", "from_version=", "to_version=",
-		"active_sha256=", "candidate_sha256=", "target=",
+		"active_sha256=", "candidate_sha256=", "target=", "candidate_starts=",
 	}
 	for index, key := range keys {
 		if !strings.HasPrefix(lines[index+1], key) {
@@ -174,6 +181,11 @@ func parseUpdatePending(encoded []byte) (updatePendingRecord, error) {
 	if _, err := artifactPlatformFilenameForTarget(values[5]); err != nil {
 		return record, errors.New("pending update target is invalid")
 	}
+	candidateStarts, err := strconv.ParseUint(values[6], 10, 8)
+	if err != nil || strconv.FormatUint(candidateStarts, 10) != values[6] ||
+		candidateStarts > maximumCandidateStarts {
+		return record, errors.New("pending update candidate start count is invalid")
+	}
 	return updatePendingRecord{
 		gatewayID:       gatewayID,
 		fromVersion:     values[1],
@@ -181,6 +193,7 @@ func parseUpdatePending(encoded []byte) (updatePendingRecord, error) {
 		activeSHA256:    activeHash,
 		candidateSHA256: candidateHash,
 		target:          values[5],
+		candidateStarts: uint8(candidateStarts),
 	}, nil
 }
 
@@ -257,6 +270,73 @@ func saveUpdatePending(paths identityPaths, record updatePendingRecord) error {
 			}
 		}
 		return errors.New("pending update record persistence failed")
+	}
+	return nil
+}
+
+// advanceCandidateStart durably consumes one of the small number of candidate
+// launch attempts. The caller holds both update locks, so replacing this
+// bounded record cannot race another legitimate lifecycle actor. A candidate
+// is never admitted when the increment's durability is ambiguous.
+func advanceCandidateStart(
+	paths identityPaths,
+	record *updatePendingRecord,
+) error {
+	return advanceCandidateStartWith(paths, record, replaceUpdatePending)
+}
+
+func advanceCandidateStartWith(
+	paths identityPaths,
+	record *updatePendingRecord,
+	replace func(identityPaths, updatePendingRecord) error,
+) error {
+	if candidateStartBudgetExhausted(record) {
+		return errors.New("unconfirmed Gateway candidate start limit reached")
+	}
+	if replace == nil {
+		return errors.New("pending update candidate start persistence is unavailable")
+	}
+	next := *record
+	next.candidateStarts++
+	if err := replace(paths, next); err != nil {
+		return err
+	}
+	*record = next
+	return nil
+}
+
+func candidateStartBudgetExhausted(record *updatePendingRecord) bool {
+	return record == nil || record.candidateStarts >= maximumCandidateStarts
+}
+
+func admittedCandidateMatchesStartupFailure(
+	record *updatePendingRecord,
+	gatewayID uuid.UUID,
+	target string,
+	activeHash [sha256.Size]byte,
+) bool {
+	return record != nil && gatewayID != uuid.Nil &&
+		record.gatewayID == gatewayID && record.target == target &&
+		record.toVersion == BuildVersion && record.candidateStarts > 0 &&
+		record.candidateSHA256 == activeHash
+}
+
+func replaceUpdatePending(paths identityPaths, next updatePendingRecord) error {
+	encoded, err := marshalUpdatePending(next)
+	if err != nil {
+		return err
+	}
+	if err := atomicWriteIdentityFile(paths, paths.updatePending, encoded, true); err != nil {
+		// A replace can report only post-publication durability ambiguity after
+		// the new counter is already visible. Re-read and resynchronize the exact
+		// record before deciding whether this launch consumed its attempt.
+		if errors.Is(err, errIdentityPublishedDurabilityUnknown) {
+			published, loadErr := loadUpdatePending(paths)
+			if loadErr == nil && published != nil && *published == next {
+				return nil
+			}
+		}
+		return errors.New("pending update candidate start persistence failed")
 	}
 	return nil
 }
@@ -483,15 +563,27 @@ func cancelPreparedUpdateLocked(candidatePath string) error {
 	// shared executable path is cleaned and synchronized. Removing the record
 	// first would let another process prepare and then lose its only previous
 	// image to this cleanup attempt.
-	for _, path := range []string{candidatePath, candidatePath + ".downloading", previousPath + ".preparing", previousPath} {
+	if err := cleanupStaleUpdateFiles(candidatePath, previousPath); err != nil {
+		return err
+	}
+	return removeUpdatePending(paths)
+}
+
+func cleanupStaleUpdateFiles(candidatePath, previousPath string) error {
+	for _, path := range []string{
+		candidatePath + ".downloading",
+		candidatePath,
+		previousPath + ".preparing",
+		previousPath,
+	} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return errors.New("prepared Gateway update cleanup failed")
+			return errors.New("stale Gateway update cleanup failed")
 		}
 	}
 	if err := syncParentDirectory(previousPath); err != nil {
-		return errors.New("prepared Gateway update cleanup sync failed")
+		return errors.New("stale Gateway update cleanup sync failed")
 	}
-	return removeUpdatePending(paths)
+	return nil
 }
 
 func runtimeReleaseTarget() (string, error) {
@@ -512,10 +604,10 @@ func reconcileUpdateStateAtStartup(gatewayID uuid.UUID) (bool, error) {
 		return false, err
 	}
 	defer release()
-	return reconcileUpdateStateLocked(gatewayID)
+	return reconcileUpdateStateLocked(gatewayID, true)
 }
 
-func reconcileUpdateStateLocked(gatewayID uuid.UUID) (bool, error) {
+func reconcileUpdateStateLocked(gatewayID uuid.UUID, admitCandidateStart bool) (bool, error) {
 	if gatewayID == uuid.Nil {
 		return false, errors.New("pending update GatewayID is unavailable")
 	}
@@ -544,15 +636,7 @@ func reconcileUpdateStateLocked(gatewayID uuid.UUID) (bool, error) {
 	if record == nil {
 		// Holding the lifecycle lock while observing no pending record proves no
 		// legitimate preparation can own these deterministic stale paths.
-		for _, stale := range []string{
-			candidatePath + ".downloading", candidatePath,
-			previousPath + ".preparing", previousPath,
-		} {
-			if err := os.Remove(stale); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return false, errors.New("stale Gateway update cleanup failed")
-			}
-		}
-		return false, nil
+		return false, cleanupStaleUpdateFiles(candidatePath, previousPath)
 	}
 	if record.gatewayID != gatewayID {
 		return false, errors.New("pending update belongs to another GatewayID")
@@ -599,6 +683,15 @@ func reconcileUpdateStateLocked(gatewayID uuid.UUID) (bool, error) {
 		if _, err := inspectGatewayCandidate(activePath, record.toVersion, record.target); err != nil {
 			return rollbackPendingUpdate(record, previousPath, activePath)
 		}
+		if admitCandidateStart {
+			if candidateStartBudgetExhausted(record) {
+				return rollbackPendingUpdate(record, previousPath, activePath)
+			}
+			if err := advanceCandidateStart(paths, record); err != nil {
+				_ = writeLifecycleStatus(lifecycleStatusRollback, record.toVersion, err.Error())
+				return rollbackPendingUpdate(record, previousPath, activePath)
+			}
+		}
 		return false, nil
 	case updateStartupRollback:
 		return rollbackPendingUpdate(record, previousPath, activePath)
@@ -612,8 +705,27 @@ func rollbackPendingUpdate(
 	previousPath string,
 	activePath string,
 ) (bool, error) {
+	return rollbackPendingUpdateWith(
+		record,
+		previousPath,
+		activePath,
+		inspectGatewayCandidate,
+		applyGatewayRollback,
+	)
+}
+
+func rollbackPendingUpdateWith(
+	record *updatePendingRecord,
+	previousPath string,
+	activePath string,
+	inspect func(string, string, string) (gatewayCandidateIdentity, error),
+	apply func(string) (gatewayReplacementOutcome, error),
+) (bool, error) {
 	if record == nil {
 		return false, errors.New("pending update rollback state is unavailable")
+	}
+	if activePath == "" || inspect == nil || apply == nil {
+		return false, errors.New("pending update rollback operation is unavailable")
 	}
 	previousHash, _, err := hashLifecycleFile(previousPath)
 	if err != nil || previousHash != record.activeSHA256 {
@@ -621,12 +733,12 @@ func rollbackPendingUpdate(
 		_ = writeLifecycleStatus(lifecycleStatusRollback, record.toVersion, failure.Error())
 		return false, failure
 	}
-	if _, err := inspectGatewayCandidate(previousPath, record.fromVersion, record.target); err != nil {
+	if _, err := inspect(previousPath, record.fromVersion, record.target); err != nil {
 		failure := errors.New("last-known-good Gateway identity is invalid")
 		_ = writeLifecycleStatus(lifecycleStatusRollback, record.toVersion, failure.Error())
 		return false, failure
 	}
-	outcome, err := applyGatewayRollback(previousPath)
+	outcome, err := apply(previousPath)
 	if err != nil {
 		_ = writeLifecycleStatus(lifecycleStatusRollback, record.toVersion, err.Error())
 	}
@@ -639,15 +751,72 @@ func rollbackPendingUpdate(
 	return false, err
 }
 
-// confirmPendingUpdate runs only after runtime identity was loaded and the
-// authoritative refresh synchronously wrote reported_version=BuildVersion.
-func confirmPendingUpdate(gatewayID uuid.UUID) error {
+// recoverCandidateAfterStartupFailure handles only failures after startup
+// reconciliation admitted an exact candidate and before its controller began.
+// A fresh terminal marker always wins. Transient control-plane failures occur
+// after the controller begins and deliberately never call this function, so a
+// live candidate retains update.pending and .previous for later confirmation.
+func recoverCandidateAfterStartupFailure(
+	gatewayID uuid.UUID,
+	startupFailure error,
+) (bool, error) {
+	if startupFailure == nil {
+		return false, errors.New("Gateway startup failure is unavailable")
+	}
 	release, err := acquireGatewayUpdateLocks(lifecycleOperationLockWait)
 	if err != nil {
-		return err
+		return false, startupFailure
 	}
 	defer release()
-	return confirmPendingUpdateLocked(gatewayID)
+	if pending, pendingErr := gatewayRemovalPending(); pendingErr != nil {
+		return false, pendingErr
+	} else if pending {
+		return false, errTerminalRemovalCommitted
+	}
+	paths, err := resolveIdentityPaths()
+	if err != nil {
+		return false, startupFailure
+	}
+	record, err := loadUpdatePending(paths)
+	if err != nil || record == nil {
+		return false, startupFailure
+	}
+	target, targetErr := runtimeReleaseTarget()
+	if targetErr != nil {
+		return false, startupFailure
+	}
+	activePath, err := installedExecutablePath()
+	if err != nil {
+		return false, startupFailure
+	}
+	activeHash, _, err := hashLifecycleFile(activePath)
+	if err != nil || !admittedCandidateMatchesStartupFailure(record, gatewayID, target, activeHash) {
+		return false, startupFailure
+	}
+	if _, err := inspectGatewayCandidate(activePath, record.toVersion, record.target); err != nil {
+		return false, startupFailure
+	}
+	previousPath, err := previousExecutablePath()
+	if err != nil {
+		return false, startupFailure
+	}
+	_ = writeLifecycleStatus(
+		lifecycleStatusRollback,
+		record.toVersion,
+		startupFailure.Error(),
+	)
+	handoff, rollbackErr := rollbackPendingUpdate(record, previousPath, activePath)
+	if handoff {
+		return true, rollbackErr
+	}
+	if rollbackErr != nil {
+		return false, fmt.Errorf(
+			"Gateway startup failed (%v) and immediate rollback failed: %w",
+			startupFailure,
+			rollbackErr,
+		)
+	}
+	return false, startupFailure
 }
 
 func confirmPendingUpdateLocked(gatewayID uuid.UUID) error {
@@ -693,23 +862,44 @@ func confirmPendingUpdateLocked(gatewayID uuid.UUID) error {
 	} else if !errors.Is(hashErr, os.ErrNotExist) {
 		return errors.New("pending update previous executable is unavailable")
 	}
+	if err := cleanupConfirmedUpdateState(paths, candidatePathOrEmpty(), previousPath); err != nil {
+		return err
+	}
+	_ = removeLifecycleStatus(paths)
+	return nil
+}
+
+func cleanupConfirmedUpdateState(
+	paths identityPaths,
+	candidatePath string,
+	previousPath string,
+) error {
 	if err := os.Remove(previousPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return errors.New("pending update previous executable removal failed")
 	}
 	if err := syncParentDirectory(previousPath); err != nil {
 		return errors.New("pending update previous executable cleanup sync failed")
 	}
+	// The rollback image is gone only after the confirmed candidate has been
+	// durably reported. Remove pending immediately after that boundary so a
+	// later best-effort stale-path cleanup cannot strand false rollback authority.
 	if err := removeUpdatePending(paths); err != nil {
 		return err
 	}
-	for _, stale := range []string{candidatePathOrEmpty(), previousPath + ".preparing"} {
-		if stale != "" {
-			_ = os.Remove(stale)
-			_ = os.Remove(stale + ".downloading")
+	stalePaths := []string{previousPath + ".preparing"}
+	if candidatePath != "" {
+		stalePaths = append(stalePaths, candidatePath+".downloading", candidatePath)
+	}
+	var cleanupErr error
+	for _, stale := range stalePaths {
+		if err := os.Remove(stale); err != nil && !errors.Is(err, os.ErrNotExist) && cleanupErr == nil {
+			cleanupErr = errors.New("confirmed Gateway update stale-file cleanup failed")
 		}
 	}
-	_ = removeLifecycleStatus(paths)
-	return nil
+	if err := syncParentDirectory(previousPath); err != nil && cleanupErr == nil {
+		cleanupErr = errors.New("confirmed Gateway update stale-file cleanup sync failed")
+	}
+	return cleanupErr
 }
 
 // reconcileAndConfirmPendingUpdate keeps recovery, confirmation and the final
@@ -723,7 +913,7 @@ func reconcileAndConfirmPendingUpdate(
 		return false, false, lifecycleStatusRollback, err
 	}
 	defer release()
-	handoff, err := reconcileUpdateStateLocked(gatewayID)
+	handoff, err := reconcileUpdateStateLocked(gatewayID, false)
 	if errors.Is(err, errTerminalRemovalCommitted) {
 		return false, true, lifecycleStatusTerminalRemoval, nil
 	}

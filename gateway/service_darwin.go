@@ -32,27 +32,33 @@ func runService() error {
 		return nil
 	}
 	if err := clearStaleFramePackageState(); err != nil {
-		return err
+		return recoverPOSIXCandidateStartupFailure(gatewayID, err)
 	}
 	ffmpegPath, err := installedFFmpegPath()
 	if err != nil {
-		return err
+		return recoverPOSIXCandidateStartupFailure(gatewayID, err)
 	}
 	if err := ensureEmbeddedFFmpeg(ffmpegPath); err != nil {
-		return err
+		return recoverPOSIXCandidateStartupFailure(gatewayID, err)
 	}
 	credentials, err := newRuntimeCredentials(ctx)
 	if err != nil {
-		return err
+		return recoverPOSIXCandidateStartupFailure(gatewayID, err)
 	}
 	if credentials.gatewayID != gatewayID {
-		return errors.New("GatewayID changed during runtime startup")
+		return recoverPOSIXCandidateStartupFailure(
+			gatewayID,
+			errors.New("GatewayID changed during runtime startup"),
+		)
 	}
 
 	resume := make(chan struct{}, 1)
 	powerWatcher, err := startPowerResumeWatcher(resume)
 	if err != nil {
-		return fmt.Errorf("power notification registration failed: %w", err)
+		return recoverPOSIXCandidateStartupFailure(
+			gatewayID,
+			fmt.Errorf("power notification registration failed: %w", err),
+		)
 	}
 	defer powerWatcher.stop()
 

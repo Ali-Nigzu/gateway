@@ -84,6 +84,7 @@ Repeat representative cases on all targets and platform-specific cases below. Ve
 - Fail/crash before previous-copy publication, after it, after `update.pending`, immediately before replacement, and immediately after replacement; classify pre/post commit correctly and converge without a release history.
 - Fail the identity-directory sync after `update.pending` becomes visible; no active replacement may occur until an exact reread successfully proves the record durable.
 - Make Postgres temporarily unavailable after the new process launches; retain the pending transition rather than declaring a healthy candidate bad.
+- Fail an admitted candidate before its controller starts: the failure must trigger immediate last-known-good rollback. Repeated power loss before confirmation must consume only the two durable candidate-start admissions and force rollback on the next start, while a live candidate waiting on Postgres must not consume additional starts.
 - Restore Postgres and prove authenticated refresh/reporting completes confirmation and cleans the one-slot fallback.
 - Constrain disk space or inject filesystem/sync failures where practical; active authority must follow the documented commit boundary.
 - Hold executable/FFmpeg file and process locks; prove bounded shutdown and native recovery behavior.
@@ -107,7 +108,9 @@ Exercise the exact predicate and both fresh reads against real Postgres:
 10. Test valid GatewayID-bound, mismatching GatewayID, valid legacy, malformed, and unreadable markers. Ambiguous state must fail closed; a mismatch must never delete the newer identity blindly.
 11. Attempt commissioning with every committed/ambiguous marker form: commissioning must refuse.
 12. Fail the identity-directory sync after a removal marker becomes visible: no deletion may start until an exact reread successfully proves it durable. If a native removal unit survives without a valid marker, the permanent POSIX service must remain fail-closed.
-13. Complete identity-directory deletion, then fail native removal-unit/plist cleanup. On retry, native tombstone cleanup must finish when the identity path is still wholly absent; recreating any identity path before that retry must instead block deletion and commissioning for operator remediation.
+13. Pause an old commissioning CLI and a certificate renewal before their final writes, complete removal and establish a replacement identity, then resume them. The old processes must reject the changed directory inode/GatewayID/hash/key and must not publish into or clean the replacement generation.
+14. On Linux and macOS, interrupt immediately before and after the helper atomically renames the entire canonical identity directory to its fixed `.removing` sibling. Before the rename, only the validating helper may progress. After the rename, stale flock waiters must fail canonical-inode validation and the native unit/job must finish the tombstone after reboot without recreating or recursively deleting a canonical identity path.
+15. Fail native removal-unit/plist cleanup after the `.removing` directory is gone. On retry, native cleanup must finish while the canonical identity path remains wholly absent; any unexpected canonical path or malformed/symlink tombstone must fail closed for operator remediation.
 
 After legitimate completion and a reboot, prove absence of Gateway and FFmpeg processes, native service definition, installed executable and embedded FFmpeg, Gateway identity, private key/certificate, meaningful work/update state, and Windows Gateway registry identity.
 
@@ -137,7 +140,8 @@ Use `camos-gateway.service` on the production filesystem/service manager.
 - Prove same-filesystem active replacement is atomic and post-rename sync/restart errors are classified post-commit.
 - Prove the removal unit remains installed until all important canonical cleanup succeeds.
 - Unlink the removal unit file while its unit remains loaded in systemd. Commissioning and normal startup must remain blocked until `daemon-reload` proves the cached unit absent; an ambiguous `LoadState` probe must fail closed.
-- Prove helper retry removes the executable, FFmpeg, `/var/lib/camos-gateway` identity/update state, main unit, and finally its own removal unit.
+- Prove the helper reduces sensitive state, removes GatewayID, and atomically renames `/var/lib/camos-gateway` to `/var/lib/camos-gateway.removing` while both flocks remain held. Reboot at that boundary and prove the stable removal unit deletes only the tombstone, then its own native state.
+- Pause lifecycle waiters on the old directory and marker inodes across the rename. They must fail post-flock canonical-name validation and must never mutate a later commission.
 
 ## macOS Intel and Apple Silicon probes
 
@@ -148,7 +152,8 @@ Use LaunchDaemon `com.camos.gateway` on both amd64 and arm64 hardware.
 - Unlink the removal plist while its job remains loaded. Commissioning and normal startup must remain blocked until `launchctl print` proves the cached job absent.
 - Reboot during download, replacement, and removal finalization.
 - Prove same-filesystem active replacement is atomic and post-rename sync/restart errors are classified post-commit.
-- Prove the removal LaunchDaemon persists until executable, FFmpeg, `/Library/Application Support/camOS Gateway`, identity/update state, and the main plist are gone, then removes itself.
+- Prove the helper reduces sensitive state, removes GatewayID, and atomically renames `/Library/Application Support/camOS Gateway` to `/Library/Application Support/camOS Gateway.removing` while both flocks remain held. Reboot at that boundary and prove the stable removal LaunchDaemon deletes only the tombstone, then removes itself.
+- Pause lifecycle waiters on the old directory and marker inodes across the rename. They must fail post-flock canonical-name validation and must never mutate a later commission.
 
 ## Accepted residual boundary
 

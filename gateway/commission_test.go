@@ -202,3 +202,59 @@ func TestCommissionCompletionStopsWhenRemovalAppears(t *testing.T) {
 		t.Fatal("completion did not stop when terminal removal appeared")
 	}
 }
+
+func TestPreparedCommissionRejectsRecreatedIdentityGeneration(t *testing.T) {
+	parent := t.TempDir()
+	directory := filepath.Join(parent, "identity")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	paths := newIdentityPaths(directory, filepath.Join(directory, "GatewayID"))
+	privateKey, err := generateGatewayPrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKeyPEM, err := marshalGatewayPrivateKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := hashCommissionID("same-commission-id")
+	if err := os.WriteFile(paths.privateKey, privateKeyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.commissionHash, hash.encoded(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := captureIdentityDirectoryGeneration(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared := preparedCommission{
+		paths:               paths,
+		hash:                hash,
+		privateKey:          privateKey,
+		directoryGeneration: generation,
+	}
+	if err := validatePreparedCommissionFiles(prepared); err != nil {
+		t.Fatalf("current prepared commission was rejected: %v", err)
+	}
+
+	retired := directory + ".retired"
+	if err := os.Rename(directory, retired); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Even identical logical contents cannot make the replacement directory
+	// the generation whose public key was sent to the Commission Service.
+	if err := os.WriteFile(paths.privateKey, privateKeyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.commissionHash, hash.encoded(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePreparedCommissionFiles(prepared); err == nil {
+		t.Fatal("recreated identity generation accepted an old commissioning response")
+	}
+}

@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -68,10 +69,23 @@ func (service *camOSWindowsService) Execute(
 	if handoff {
 		return windowsServiceResult(controllerExitLifecycleHandoff)
 	}
+	recoverStartupFailure := func(failure error, exitCode uint32) (bool, uint32) {
+		recoveryHandoff, recoveryErr := recoverCandidateAfterStartupFailure(gatewayID, failure)
+		if errors.Is(recoveryErr, errTerminalRemovalCommitted) {
+			if err := beginGatewayRemoval(); err == nil {
+				return windowsServiceResultForHandoff(controllerExitLifecycleHandoff, true)
+			}
+			return windowsServiceResult(controllerExitLifecycleHandoff)
+		}
+		if recoveryHandoff {
+			return windowsServiceResult(controllerExitLifecycleHandoff)
+		}
+		return true, exitCode
+	}
 
 	processJob, exitCode := createProcessLifetimeJob()
 	if exitCode != 0 {
-		return true, exitCode
+		return recoverStartupFailure(errors.New("Gateway process job startup failed"), exitCode)
 	}
 	// KILL_ON_JOB_CLOSE makes this handle process-lifetime state. The operating
 	// system closes it as this service process exits; closing it earlier would
@@ -79,22 +93,28 @@ func (service *camOSWindowsService) Execute(
 	service.processJob = processJob
 
 	if err := clearStaleFramePackageState(); err != nil {
-		return true, serviceExitRuntimeIdentity
+		return recoverStartupFailure(err, serviceExitRuntimeIdentity)
 	}
 	ffmpegPath, err := installedFFmpegPath()
-	if err != nil || ensureEmbeddedFFmpeg(ffmpegPath) != nil {
-		return true, serviceExitEmbeddedPayload
+	if err != nil {
+		return recoverStartupFailure(err, serviceExitEmbeddedPayload)
+	}
+	if err := ensureEmbeddedFFmpeg(ffmpegPath); err != nil {
+		return recoverStartupFailure(err, serviceExitEmbeddedPayload)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	credentials, err := newRuntimeCredentials(ctx)
 	if err != nil {
 		cancel()
-		return true, serviceExitRuntimeIdentity
+		return recoverStartupFailure(err, serviceExitRuntimeIdentity)
 	}
 	if credentials.gatewayID != gatewayID {
 		cancel()
-		return true, serviceExitRuntimeIdentity
+		return recoverStartupFailure(
+			errors.New("GatewayID changed during runtime startup"),
+			serviceExitRuntimeIdentity,
+		)
 	}
 	resume := make(chan struct{}, 1)
 	controllerDone := make(chan controllerExit, 1)

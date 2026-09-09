@@ -48,7 +48,7 @@ const launchDaemonPropertyList = `<?xml version="1.0" encoding="UTF-8"?>
 </plist>
 `
 
-func installService() error {
+func installService(prepared preparedCommission, now time.Time) error {
 	if os.Geteuid() != 0 {
 		return errors.New("Gateway service installation must be run as root")
 	}
@@ -67,6 +67,9 @@ func installService() error {
 		return err
 	}
 	if err := ensureCommissioningAllowed(identityPaths); err != nil {
+		return err
+	}
+	if err := validatePreparedCommissionServiceInstall(prepared, now); err != nil {
 		return err
 	}
 	if err := validateEmbeddedRelease(); err != nil {

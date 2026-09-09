@@ -71,6 +71,14 @@ func newIdentityPaths(directory, gatewayIDPath string) identityPaths {
 	}
 }
 
+func captureIdentityDirectoryGeneration(paths identityPaths) (os.FileInfo, error) {
+	info, err := os.Lstat(paths.directory)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("Gateway identity directory is invalid")
+	}
+	return info, nil
+}
+
 type commissionHash [sha256.Size]byte
 
 func hashCommissionID(raw string) commissionHash {
@@ -360,14 +368,6 @@ func loadPendingCommissionHash(paths identityPaths) (*commissionHash, error) {
 		return nil, err
 	}
 	return &hash, nil
-}
-
-func pendingCommissionHash() (*commissionHash, error) {
-	paths, err := resolveIdentityPaths()
-	if err != nil {
-		return nil, err
-	}
-	return loadPendingCommissionHash(paths)
 }
 
 func removePendingCommissionHash() error {

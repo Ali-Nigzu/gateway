@@ -42,16 +42,22 @@ func TestLaunchctlAbsenceRequiresSpecificSystemDomainResult(t *testing.T) {
 
 func TestRemovalLaunchDaemonRetainsNativeFinalizerAcrossHelperUnlink(t *testing.T) {
 	helper := gatewayIdentityDirectory + "/work/camos-gateway-removal"
-	propertyList := removalLaunchDaemonPropertyList(helper)
+	propertyList, err := removalLaunchDaemonPropertyList(helper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tombstone := gatewayIdentityDirectory + ".removing"
 	for _, required := range []string{
 		"<string>/bin/sh</string>",
 		"<string>-c</string>",
 		"internal-remove",
 		removalPendingFilename,
-		gatewayIdentityPath,
 		gatewayIdentityDirectory,
+		tombstone,
 		removalLaunchDaemonPath,
 		"/bin/launchctl bootout",
+		"test -d",
+		"test ! -L",
 	} {
 		if !strings.Contains(propertyList, required) {
 			t.Fatalf("removal LaunchDaemon is missing %q", required)
@@ -63,7 +69,10 @@ func TestRemovalLaunchDaemonRetainsNativeFinalizerAcrossHelperUnlink(t *testing.
 	if strings.Index(propertyList, removalPendingFilename) > strings.Index(propertyList, "/bin/rm -rf") {
 		t.Fatal("native finalization can delete an existing identity without the committed marker")
 	}
-	if strings.Index(propertyList, gatewayIdentityPath) > strings.Index(propertyList, "/bin/rm -rf") {
-		t.Fatal("native finalization can delete an identity before helper completion is proven")
+	if strings.Index(propertyList, tombstone) > strings.Index(propertyList, "/bin/rm -rf") {
+		t.Fatal("native finalization does not bind recursive cleanup to the removal tombstone")
+	}
+	if strings.Count(propertyList, "test ! -L") < 4 {
+		t.Fatal("native finalization does not reject symlinked identity authority paths")
 	}
 }

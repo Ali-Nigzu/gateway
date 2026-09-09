@@ -38,7 +38,7 @@ type windowsPackagePaths struct {
 	ffmpeg     string
 }
 
-func installService() error {
+func installService(prepared preparedCommission, now time.Time) error {
 	releaseLifecycle, err := acquireGatewayLifecycleLock(lifecycleOperationLockWait)
 	if err != nil {
 		return err
@@ -54,6 +54,9 @@ func installService() error {
 		return err
 	}
 	if err := ensureCommissioningAllowed(identityPaths); err != nil {
+		return err
+	}
+	if err := validatePreparedCommissionServiceInstall(prepared, now); err != nil {
 		return err
 	}
 	if err := validateEmbeddedRelease(); err != nil {

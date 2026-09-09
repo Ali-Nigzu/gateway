@@ -22,10 +22,17 @@ func requireCommissionPrivileges() error {
 	return nil
 }
 
-func prepareIdentityDirectory(paths identityPaths) error {
+// createIdentityDirectory is reserved for the explicit commissioning entry
+// point. Normal runtime state writes must never recreate this directory: its
+// absence may be the completion boundary of terminal removal.
+func createIdentityDirectory(paths identityPaths) error {
 	if err := os.MkdirAll(paths.directory, 0o700); err != nil {
 		return errors.New("Gateway identity directory creation failed")
 	}
+	return prepareIdentityDirectory(paths)
+}
+
+func prepareIdentityDirectory(paths identityPaths) error {
 	info, err := os.Lstat(paths.directory)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return errors.New("Gateway identity directory is invalid")
@@ -46,7 +53,17 @@ func prepareIdentityWorkDirectory(paths identityPaths) error {
 	if err := prepareIdentityDirectory(paths); err != nil {
 		return err
 	}
-	if err := ensureRootDirectory(paths.workDirectory, 0o700); err != nil {
+	if err := os.Mkdir(paths.workDirectory, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return errors.New("Gateway work directory preparation failed")
+	}
+	info, err := os.Lstat(paths.workDirectory)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("Gateway work directory preparation failed")
+	}
+	if err := os.Chown(paths.workDirectory, 0, 0); err != nil {
+		return errors.New("Gateway work directory preparation failed")
+	}
+	if err := os.Chmod(paths.workDirectory, 0o700); err != nil {
 		return errors.New("Gateway work directory preparation failed")
 	}
 	return nil
@@ -135,11 +152,4 @@ func gatewayIDCommitPresent() (bool, error) {
 		return false, nil
 	}
 	return false, errors.New("GatewayID inspection failed")
-}
-
-func deleteGatewayID() error {
-	if err := os.Remove(gatewayIdentityPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return errors.New("GatewayID removal failed")
-	}
-	return syncIdentityDirectory(filepath.Dir(gatewayIdentityPath))
 }

@@ -34,7 +34,8 @@ func TestUpdatePendingRecordIsExactFixedFormat(t *testing.T) {
 		"to_version=1.1\n" +
 		"active_sha256=96879611650f80a81392a52e0db9b0237669087c4518e1c130e541a505e0eeef\n" +
 		"candidate_sha256=dda18a0e21ae47c53b4309434cbc02ae8bf764fa83a6defbb719431242722aa7\n" +
-		"target=windows-amd64.exe\n"
+		"target=windows-amd64.exe\n" +
+		"candidate_starts=0\n"
 	if string(encoded) != want {
 		t.Fatalf("pending record = %q, want %q", encoded, want)
 	}
@@ -57,6 +58,10 @@ func TestUpdatePendingRecordRejectsAmbiguousState(t *testing.T) {
 		[]byte(strings.Replace(string(valid), "to_version=1.1", "to_version=1.0", 1)),
 		[]byte(strings.Replace(string(valid), "active_sha256=9", "active_sha256=A", 1)),
 		[]byte(strings.Replace(string(valid), "gateway_id=1d91378f-7b96-4e6f-95b2-1304b728d28f", "gateway_id=not-a-uuid", 1)),
+		[]byte(strings.Replace(string(valid), "candidate_starts=0", "candidate_starts=-1", 1)),
+		[]byte(strings.Replace(string(valid), "candidate_starts=0", "candidate_starts=00", 1)),
+		[]byte(strings.Replace(string(valid), "candidate_starts=0", "candidate_starts=3", 1)),
+		[]byte(strings.Replace(string(valid), "candidate_starts=0", "candidate_starts=unknown", 1)),
 	}
 	for index, encoded := range invalid {
 		if _, err := parseUpdatePending(encoded); err == nil {
@@ -82,6 +87,250 @@ func TestUpdatePendingCreateOnlyRaceDoesNotAdoptAnotherPublisher(t *testing.T) {
 	actual, err := os.ReadFile(paths.updatePending)
 	if err != nil || string(actual) != string(encoded) {
 		t.Fatalf("winning pending record changed: %q err=%v", actual, err)
+	}
+}
+
+func TestCandidateStartsAreDurableBoundedAndRetainRecoveryState(t *testing.T) {
+	directory := t.TempDir()
+	paths := newIdentityPaths(directory, filepath.Join(directory, "GatewayID"))
+	record := testPendingUpdateRecord()
+	encoded, err := marshalUpdatePending(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.updatePending, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previous := filepath.Join(directory, "camos-gateway.previous")
+	previousContents := []byte("last-known-good")
+	if err := os.WriteFile(previous, previousContents, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	replace := func(paths identityPaths, next updatePendingRecord) error {
+		encoded, err := marshalUpdatePending(next)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(paths.updatePending, encoded, 0o600)
+	}
+
+	for want := uint8(1); want <= maximumCandidateStarts; want++ {
+		if err := advanceCandidateStartWith(paths, &record, replace); err != nil {
+			t.Fatalf("candidate start %d was not admitted: %v", want, err)
+		}
+		if record.candidateStarts != want {
+			t.Fatalf("in-memory candidate starts = %d, want %d", record.candidateStarts, want)
+		}
+		loaded, err := loadUpdatePending(paths)
+		if err != nil || loaded == nil || loaded.candidateStarts != want {
+			t.Fatalf("durable candidate starts = %#v, err=%v, want %d", loaded, err, want)
+		}
+		if contents, err := os.ReadFile(previous); err != nil || string(contents) != string(previousContents) {
+			t.Fatalf("unconfirmed candidate lost .previous: %q err=%v", contents, err)
+		}
+	}
+	before, err := os.ReadFile(paths.updatePending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := advanceCandidateStartWith(paths, &record, replace); err == nil {
+		t.Fatal("candidate start beyond the fixed budget was admitted")
+	}
+	after, err := os.ReadFile(paths.updatePending)
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("rejected candidate start changed pending state: %q err=%v", after, err)
+	}
+
+	invalid := testPendingUpdateRecord()
+	invalid.candidateStarts = maximumCandidateStarts + 1
+	if _, err := marshalUpdatePending(invalid); err == nil {
+		t.Fatal("out-of-range candidate start count was marshaled")
+	}
+}
+
+func TestRepeatedUnconfirmedCandidateCrashSelectsRollback(t *testing.T) {
+	directory := t.TempDir()
+	previous := filepath.Join(directory, "camos-gateway.previous")
+	contents := []byte("last-known-good-after-candidate-crashes")
+	if err := os.WriteFile(previous, contents, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	record := testPendingUpdateRecord()
+	record.activeSHA256 = sha256.Sum256(contents)
+	record.candidateStarts = maximumCandidateStarts
+	if !candidateStartBudgetExhausted(&record) {
+		t.Fatal("repeated unconfirmed starts did not exhaust the launch budget")
+	}
+	handoff, err := rollbackPendingUpdateWith(
+		&record,
+		previous,
+		filepath.Join(directory, "camos-gateway"),
+		func(string, string, string) (gatewayCandidateIdentity, error) {
+			return gatewayCandidateIdentity{}, nil
+		},
+		func(string) (gatewayReplacementOutcome, error) {
+			return gatewayReplacementPostCommit, nil
+		},
+	)
+	if err != nil || !handoff {
+		t.Fatalf("exhausted candidate did not commit rollback: handoff=%v err=%v", handoff, err)
+	}
+}
+
+func TestExplicitStartupFailureRollsBackOnlyTheAdmittedCandidate(t *testing.T) {
+	record := testPendingUpdateRecord()
+	record.fromVersion = "0.9"
+	record.toVersion = BuildVersion
+	record.candidateStarts = 1
+	if !admittedCandidateMatchesStartupFailure(
+		&record,
+		record.gatewayID,
+		record.target,
+		record.candidateSHA256,
+	) {
+		t.Fatal("exact admitted candidate was not eligible for immediate startup-failure rollback")
+	}
+	for _, changed := range []updatePendingRecord{
+		func() updatePendingRecord { value := record; value.candidateStarts = 0; return value }(),
+		func() updatePendingRecord { value := record; value.toVersion = "1.1"; return value }(),
+		func() updatePendingRecord { value := record; value.target = "linux-amd64"; return value }(),
+	} {
+		if admittedCandidateMatchesStartupFailure(
+			&changed,
+			record.gatewayID,
+			record.target,
+			record.candidateSHA256,
+		) {
+			t.Fatalf("non-admitted startup state was eligible: %#v", changed)
+		}
+	}
+	wrongHash := sha256.Sum256([]byte("other candidate"))
+	if admittedCandidateMatchesStartupFailure(&record, record.gatewayID, record.target, wrongHash) {
+		t.Fatal("wrong active bytes were eligible for immediate rollback")
+	}
+}
+
+func TestDowngradeUsesTheSamePendingRecordAndCandidateDecision(t *testing.T) {
+	record := testPendingUpdateRecord()
+	record.fromVersion = "1.0"
+	record.toVersion = "0.9"
+	encoded, err := marshalUpdatePending(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseUpdatePending(encoded)
+	if err != nil || parsed != record {
+		t.Fatalf("downgrade pending record = %#v, err=%v", parsed, err)
+	}
+	previous := record.activeSHA256
+	active := record.candidateSHA256
+	action, err := decideUpdateStartupAction(
+		&parsed,
+		record.gatewayID,
+		"0.9",
+		record.target,
+		&active,
+		&previous,
+	)
+	if err != nil || action != updateStartupRunCandidate {
+		t.Fatalf("downgrade candidate action = %d, err=%v", action, err)
+	}
+}
+
+func TestCanonicalStaleUpdateCleanupRemovesEveryDeterministicPath(t *testing.T) {
+	directory := t.TempDir()
+	candidate := filepath.Join(directory, "camos-gateway.candidate")
+	previous := filepath.Join(directory, "camos-gateway.previous")
+	paths := []string{candidate + ".downloading", candidate, previous + ".preparing", previous}
+	for _, path := range paths {
+		if err := os.WriteFile(path, []byte("stale"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := cleanupStaleUpdateFiles(candidate, previous); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stale update path survived: %s (%v)", path, err)
+		}
+	}
+}
+
+func TestSuccessfulConfirmationCleanupRemovesPendingAndExecutableState(t *testing.T) {
+	identityDirectory := t.TempDir()
+	packageDirectory := t.TempDir()
+	paths := newIdentityPaths(identityDirectory, filepath.Join(identityDirectory, "GatewayID"))
+	candidate := filepath.Join(packageDirectory, "camos-gateway.candidate")
+	previous := filepath.Join(packageDirectory, "camos-gateway.previous")
+	state := []string{
+		paths.updatePending,
+		candidate + ".downloading",
+		candidate,
+		previous + ".preparing",
+		previous,
+	}
+	for _, path := range state {
+		if err := os.WriteFile(path, []byte("state"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := cleanupConfirmedUpdateState(paths, candidate, previous); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range state {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("confirmed update path survived: %s (%v)", path, err)
+		}
+	}
+}
+
+func TestRollbackUsesValidatedPreviousAndExplicitReplacementOutcome(t *testing.T) {
+	directory := t.TempDir()
+	previous := filepath.Join(directory, "camos-gateway.previous")
+	contents := []byte("last-known-good")
+	if err := os.WriteFile(previous, contents, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	record := testPendingUpdateRecord()
+	record.activeSHA256 = sha256.Sum256(contents)
+	inspect := func(path, version, target string) (gatewayCandidateIdentity, error) {
+		if path != previous || version != record.fromVersion || target != record.target {
+			t.Fatalf("unexpected rollback inspection: %q %q %q", path, version, target)
+		}
+		return gatewayCandidateIdentity{}, nil
+	}
+	for _, test := range []struct {
+		name        string
+		outcome     gatewayReplacementOutcome
+		applyErr    error
+		wantHandoff bool
+		wantError   bool
+	}{
+		{name: "pre-commit without commit", outcome: gatewayReplacementPreCommit, wantError: true},
+		{name: "pre-commit failure", outcome: gatewayReplacementPreCommit, applyErr: errors.New("replace failed"), wantError: true},
+		{name: "post-commit", outcome: gatewayReplacementPostCommit, wantHandoff: true},
+		{name: "helper handoff", outcome: gatewayReplacementHelperHandoff, wantHandoff: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			applied := 0
+			handoff, err := rollbackPendingUpdateWith(
+				&record,
+				previous,
+				filepath.Join(directory, "camos-gateway"),
+				inspect,
+				func(path string) (gatewayReplacementOutcome, error) {
+					applied++
+					if path != previous {
+						t.Fatalf("applied rollback path = %q", path)
+					}
+					return test.outcome, test.applyErr
+				},
+			)
+			if applied != 1 || handoff != test.wantHandoff || (err != nil) != test.wantError {
+				t.Fatalf("applied=%d handoff=%v err=%v", applied, handoff, err)
+			}
+		})
 	}
 }
 

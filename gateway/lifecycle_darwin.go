@@ -27,11 +27,42 @@ func beginGatewayRemoval() error {
 	if err != nil {
 		return err
 	}
+	required, err := posixRemovalHelperPreparationRequired(paths)
+	if err != nil {
+		return err
+	}
+	if !required {
+		return nil
+	}
+	releaseRemoval, err := acquireGatewayRemovalLock(lifecycleOperationLockWait)
+	if err != nil {
+		// A finalizer may have removed the marker while this duplicate actor
+		// waited to join removal. Treat only a freshly proven terminal state as
+		// successful completion; every ambiguous state remains fail-closed.
+		if required, retryErr := posixRemovalHelperPreparationRequired(paths); retryErr == nil && !required {
+			return nil
+		}
+		return err
+	}
+	defer releaseRemoval()
+	required, err = posixRemovalHelperPreparationRequired(paths)
+	if err != nil {
+		return err
+	}
+	if !required {
+		return nil
+	}
+	if err := prepareIdentityWorkDirectory(paths); err != nil {
+		return err
+	}
 	helperPath := filepath.Join(paths.workDirectory, removalHelperFilename)
 	if err := installRemovalHelper(paths.workDirectory, helperPath); err != nil {
 		return err
 	}
-	propertyList := removalLaunchDaemonPropertyList(helperPath)
+	propertyList, err := removalLaunchDaemonPropertyList(helperPath)
+	if err != nil {
+		return err
+	}
 	if err := writeRootFileAtomically(
 		removalLaunchDaemonPath,
 		[]byte(propertyList),
@@ -55,23 +86,20 @@ func beginGatewayRemoval() error {
 	return nil
 }
 
-func removalLaunchDaemonPropertyList(helperPath string) string {
-	// Use a stable OS executable as the final launchd program. The custom
-	// Gateway helper validates committed authority and performs sensitive
-	// cleanup first; after it succeeds and unlinks itself, this wrapper can
-	// idempotently finish deletion even on the next boot.
-	finalizer := fmt.Sprintf(
-		"set -e; if [ -x %s ]; then %s internal-remove; fi; if [ -e %s ] || [ -L %s ]; then test -f %s; test ! -e %s; test ! -L %s; test ! -e %s; test ! -L %s; /bin/rm -rf -- %s; fi; /bin/rm -f -- %s; /bin/rm -f -- %s; /bin/launchctl bootout %s",
-		quotePOSIXShellArgument(helperPath),
-		quotePOSIXShellArgument(helperPath),
-		quotePOSIXShellArgument(gatewayIdentityDirectory),
-		quotePOSIXShellArgument(gatewayIdentityDirectory),
-		quotePOSIXShellArgument(filepath.Join(gatewayIdentityDirectory, removalPendingFilename)),
-		quotePOSIXShellArgument(gatewayIdentityPath),
-		quotePOSIXShellArgument(gatewayIdentityPath),
-		quotePOSIXShellArgument(helperPath),
-		quotePOSIXShellArgument(helperPath),
-		quotePOSIXShellArgument(gatewayIdentityDirectory),
+func removalLaunchDaemonPropertyList(helperPath string) (string, error) {
+	// Use a stable OS executable as the final launchd program. The helper holds
+	// both flocks until it atomically retires the canonical identity root. This
+	// stable wrapper can then finish the deterministic tombstone after reboot.
+	paths, err := resolveIdentityPaths()
+	if err != nil {
+		return "", err
+	}
+	prefix, err := posixRemovalFinalizerPrefix(paths, helperPath)
+	if err != nil {
+		return "", err
+	}
+	finalizer := prefix + fmt.Sprintf(
+		"; /bin/rm -f -- %s; /bin/rm -f -- %s; /bin/launchctl bootout %s",
 		quotePOSIXShellArgument(removalLaunchDaemonPath+".installing"),
 		quotePOSIXShellArgument(removalLaunchDaemonPath),
 		quotePOSIXShellArgument(removalLaunchDaemonTarget),
@@ -98,7 +126,7 @@ func removalLaunchDaemonPropertyList(helperPath string) string {
     <integer>63</integer>
 </dict>
 </plist>
-`, removalLaunchDaemonLabel, html.EscapeString(finalizer))
+`, removalLaunchDaemonLabel, html.EscapeString(finalizer)), nil
 }
 
 func launchDaemonTargetLoaded(target string) (bool, error) {
@@ -143,6 +171,16 @@ func runDarwinRemovalHelper() error {
 	if os.Geteuid() != 0 {
 		return errors.New("terminal Gateway removal helper must run as root")
 	}
+	releaseLifecycle, err := acquireGatewayLifecycleLock(lifecycleOperationLockWait)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
+	releaseRemoval, err := acquireGatewayRemovalLock(lifecycleOperationLockWait)
+	if err != nil {
+		return err
+	}
+	defer releaseRemoval()
 	pending, err := gatewayRemovalPending()
 	if err != nil {
 		return err
@@ -178,24 +216,18 @@ func runDarwinRemovalHelper() error {
 		return err
 	}
 	helperPath := filepath.Join(paths.workDirectory, removalHelperFilename)
-	if err := prepareIdentityForFinalRemoval(paths, helperPath); err != nil {
-		return err
-	}
-	// GatewayID absence and helper absence together are the wrapper's narrow
-	// proof that the validating helper crossed its successful cleanup boundary.
-	// Either deletion may be retried after a crash; neither permits a stale
-	// native wrapper to delete a different, still-committed identity.
-	if err := deleteGatewayID(); err != nil {
-		return fmt.Errorf("GatewayID final removal failed: %w", err)
-	}
-	if err := removeFileIfPresent(helperPath); err != nil {
-		return fmt.Errorf("removal helper unlink failed: %w", err)
-	}
-	return syncIdentityDirectory(paths.workDirectory)
+	return stageIdentityDirectoryForRemoval(paths, helperPath)
 }
 
 func platformRemovalStatePresent() (bool, error) {
-	_, err := os.Lstat(removalLaunchDaemonPath)
+	paths, err := resolveIdentityPaths()
+	if err != nil {
+		return false, err
+	}
+	if present, err := posixRemovalTombstonePresent(paths); err != nil || present {
+		return present, err
+	}
+	_, err = os.Lstat(removalLaunchDaemonPath)
 	if err == nil {
 		return true, nil
 	}

@@ -160,6 +160,24 @@ func TestTerminalRemovalNeverCommitsAfterPreCommitFailure(t *testing.T) {
 	}
 }
 
+func TestTerminalRemovalMarkerPublicationFailureNeverCommits(t *testing.T) {
+	first := gatewayControl{desiredState: 0, desiredVersion: BuildVersion}
+	markerWrites := 0
+	committed, err := commitTerminalRemoval(
+		context.Background(),
+		first,
+		func() bool { return true },
+		func(context.Context) (gatewayControl, error) { return first, nil },
+		func() error {
+			markerWrites++
+			return errors.New("marker storage unavailable")
+		},
+	)
+	if err == nil || committed || markerWrites != 1 {
+		t.Fatalf("committed=%v writes=%d err=%v", committed, markerWrites, err)
+	}
+}
+
 func TestCommittedRemovalRetriesOnlyLocalContinuation(t *testing.T) {
 	stops := 0
 	starts := 0

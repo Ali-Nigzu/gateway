@@ -84,3 +84,28 @@ func TestEveryNativeServiceRecoversUpdatesBeforeOptionalRuntimeStartup(t *testin
 		}
 	}
 }
+
+func TestEveryNativeServiceRecoversCandidateAfterPreControllerFailure(t *testing.T) {
+	for _, name := range []string{
+		"service_windows.go",
+		"service_linux.go",
+		"service_darwin.go",
+	} {
+		encoded, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		source := string(encoded)
+		reconcile := strings.Index(source, "reconcileUpdateStateAtStartup(")
+		recoveryName := "recoverPOSIXCandidateStartupFailure("
+		if name == "service_windows.go" {
+			recoveryName = "recoverCandidateAfterStartupFailure("
+		}
+		recovery := strings.Index(source, recoveryName)
+		controller := strings.Index(source, "runController(")
+		if reconcile < 0 || recovery < 0 || controller < 0 ||
+			reconcile > recovery || recovery > controller {
+			t.Fatalf("%s does not recover an admitted candidate after pre-controller startup failure", name)
+		}
+	}
+}

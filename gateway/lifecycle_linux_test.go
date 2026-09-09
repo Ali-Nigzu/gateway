@@ -39,30 +39,33 @@ func TestSystemdLoadStateRequiresExplicitNotFound(t *testing.T) {
 
 func TestSystemdRemovalUnitRetainsNativeFinalizerAcrossHelperUnlink(t *testing.T) {
 	helper := "/var/lib/camos-gateway/work/camos-gateway-removal"
-	unit := systemdRemovalUnit(helper)
+	unit, err := systemdRemovalUnit(helper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tombstone := gatewayIdentityDirectory + ".removing"
 	for _, required := range []string{
 		"ExecStart=/bin/sh -c",
-		helper + " internal-remove",
-		"if [ -e " + gatewayIdentityDirectory + " ] || [ -L " + gatewayIdentityDirectory + " ]",
-		"test -f " + filepath.Join(gatewayIdentityDirectory, removalPendingFilename),
-		"test ! -e " + gatewayIdentityPath,
-		"test ! -L " + helper,
-		"/bin/rm -rf -- " + gatewayIdentityDirectory,
-		"/bin/rm -f -- " + systemdRemovalUnitPath,
+		helper,
+		"internal-remove",
+		gatewayIdentityDirectory,
+		filepath.Join(gatewayIdentityDirectory, removalPendingFilename),
+		tombstone,
+		"/bin/rm -rf --",
+		systemdRemovalUnitPath,
 		"/bin/systemctl daemon-reload",
 	} {
 		if !strings.Contains(unit, required) {
 			t.Fatalf("removal unit is missing %q", required)
 		}
 	}
-	if strings.Index(unit, helper+" internal-remove") > strings.Index(unit, "/bin/rm -rf -- "+gatewayIdentityDirectory) {
+	if strings.Index(unit, "internal-remove") > strings.Index(unit, "/bin/rm -rf --") {
 		t.Fatal("native finalization can delete identity before the validated helper succeeds")
 	}
-	if strings.Index(unit, "test -f "+filepath.Join(gatewayIdentityDirectory, removalPendingFilename)) > strings.Index(unit, "/bin/rm -rf -- "+gatewayIdentityDirectory) {
+	if strings.Index(unit, removalPendingFilename) > strings.Index(unit, "/bin/rm -rf --") {
 		t.Fatal("native finalization can delete an existing identity without the committed marker")
 	}
-	if strings.Index(unit, "test ! -e "+gatewayIdentityPath) > strings.Index(unit, "/bin/rm -rf -- "+gatewayIdentityDirectory) ||
-		strings.Index(unit, "test ! -L "+helper) > strings.Index(unit, "/bin/rm -rf -- "+gatewayIdentityDirectory) {
-		t.Fatal("native finalization can delete an identity before helper completion is proven")
+	if strings.Index(unit, tombstone) > strings.Index(unit, "/bin/rm -rf --") {
+		t.Fatal("native finalization does not bind recursive cleanup to the removal tombstone")
 	}
 }
