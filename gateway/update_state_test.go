@@ -192,7 +192,7 @@ func TestExplicitStartupFailureRollsBackOnlyTheAdmittedCandidate(t *testing.T) {
 	}
 	for _, changed := range []updatePendingRecord{
 		func() updatePendingRecord { value := record; value.candidateStarts = 0; return value }(),
-		func() updatePendingRecord { value := record; value.toVersion = "1.1"; return value }(),
+		func() updatePendingRecord { value := record; value.toVersion = "2.0"; return value }(),
 		func() updatePendingRecord { value := record; value.target = "linux-amd64"; return value }(),
 	} {
 		if admittedCandidateMatchesStartupFailure(

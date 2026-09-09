@@ -19,7 +19,7 @@ func TestControlPriorityTruthTable(t *testing.T) {
 		expected controlPriority
 	}{
 		{"state zero null removes", gatewayControl{desiredState: 0}, controlPriorityRemove},
-		{"terminal outranks update", gatewayControl{desiredState: 0, desiredVersion: "1.1"}, controlPriorityRemove},
+		{"terminal outranks update", gatewayControl{desiredState: 0, desiredVersion: "2.0"}, controlPriorityRemove},
 		{"state zero assigned parks", gatewayControl{desiredState: 0, siteID: validInt64(7)}, controlPriorityPark},
 		{"state one assigned parks", gatewayControl{desiredState: 1, siteID: validInt64(7)}, controlPriorityPark},
 		{"state one null parks", gatewayControl{desiredState: 1}, controlPriorityPark},
@@ -28,8 +28,8 @@ func TestControlPriorityTruthTable(t *testing.T) {
 		{"disabled organisation parks", disabledOrganisationControl(), controlPriorityPark},
 		{"disabled site parks", disabledSiteControl(), controlPriorityPark},
 		{"active hierarchy runs", active, controlPriorityRun},
-		{"upgrade mismatch updates", withDesiredVersion(active, "1.1"), controlPriorityUpdate},
-		{"version 1.0 stays", withDesiredVersion(active, BuildVersion), controlPriorityRun},
+		{"upgrade mismatch updates", withDesiredVersion(active, "2.0"), controlPriorityUpdate},
+		{"current version stays", withDesiredVersion(active, BuildVersion), controlPriorityRun},
 		{"older release downgrades", withDesiredVersion(active, "0.9"), controlPriorityUpdate},
 	}
 	for _, test := range tests {
@@ -42,16 +42,16 @@ func TestControlPriorityTruthTable(t *testing.T) {
 }
 
 func TestCandidateTargetRequiresUnchangedNonTerminalControl(t *testing.T) {
-	active := withDesiredVersion(activeTestControl(), "1.1")
-	if !candidateTargetStillCurrent("1.1", active) {
+	active := withDesiredVersion(activeTestControl(), "2.0")
+	if !candidateTargetStillCurrent("2.0", active) {
 		t.Fatal("unchanged target was rejected")
 	}
-	changed := withDesiredVersion(active, "1.2")
-	if candidateTargetStillCurrent("1.1", changed) {
+	changed := withDesiredVersion(active, "2.1")
+	if candidateTargetStillCurrent("2.0", changed) {
 		t.Fatal("stale target was accepted")
 	}
-	terminal := gatewayControl{desiredState: 0, desiredVersion: "1.1"}
-	if candidateTargetStillCurrent("1.1", terminal) {
+	terminal := gatewayControl{desiredState: 0, desiredVersion: "2.0"}
+	if candidateTargetStillCurrent("2.0", terminal) {
 		t.Fatal("terminal removal did not outrank update")
 	}
 	if candidateTargetStillCurrent(BuildVersion, activeTestControl()) {
@@ -60,13 +60,13 @@ func TestCandidateTargetRequiresUnchangedNonTerminalControl(t *testing.T) {
 }
 
 func TestCandidateAttemptRejectsEveryLifecycleFingerprintChange(t *testing.T) {
-	original := withDesiredVersion(activeTestControl(), "1.1")
+	original := withDesiredVersion(activeTestControl(), "2.0")
 	if !candidateAttemptStillCurrent(original, original) {
 		t.Fatal("unchanged lifecycle fingerprint was rejected")
 	}
 	changes := map[string]func(gatewayControl) gatewayControl{
 		"desired version": func(control gatewayControl) gatewayControl {
-			control.desiredVersion = "1.2"
+			control.desiredVersion = "2.1"
 			return control
 		},
 		"desired state": func(control gatewayControl) gatewayControl {
@@ -142,7 +142,7 @@ func TestTerminalRemovalNeverCommitsAfterPreCommitFailure(t *testing.T) {
 		{name: "second read failed", stop: true, second: first, readErr: errors.New("db unavailable")},
 		{name: "site assigned", stop: true, second: gatewayControl{desiredState: 0, desiredVersion: BuildVersion, siteID: validInt64(7)}},
 		{name: "state changed", stop: true, second: gatewayControl{desiredState: 1, desiredVersion: BuildVersion}},
-		{name: "version changed", stop: true, second: gatewayControl{desiredState: 0, desiredVersion: "1.1"}},
+		{name: "version changed", stop: true, second: gatewayControl{desiredState: 0, desiredVersion: "2.0"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

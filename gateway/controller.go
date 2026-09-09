@@ -928,7 +928,7 @@ func startEngine(
 		done:           make(chan error, 1),
 	}
 	go func() {
-		engine.done <- startGateway(engineCtx, snapshot.devices, credentials)
+		engine.done <- runGatewayApplication(engineCtx, snapshot.devices, credentials)
 	}()
 	return engine
 }
