@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"math/big"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -167,6 +168,36 @@ func TestCertificateConfigurationUsesOnlyAbsoluteKeyAndCertificatePaths(t *testi
 	}
 	if _, err := marshalCertificateConfig("relative.pem", privateKeyPath); err == nil {
 		t.Fatal("relative certificate path was accepted")
+	}
+}
+
+func TestDurableIdentityEntryRejectsReplacementOrAbsence(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "commit-record")
+	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := requireDurableIdentityEntry(directory, path, original); err != nil {
+		t.Fatalf("unchanged entry was rejected: %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := requireDurableIdentityEntry(directory, path, original); err == nil {
+		t.Fatal("replacement entry was accepted as the original commit record")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := requireDurableIdentityEntry(directory, path, nil); err == nil {
+		t.Fatal("absent commit record was accepted as durable")
 	}
 }
 

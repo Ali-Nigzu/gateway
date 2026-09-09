@@ -8,6 +8,7 @@ import (
 )
 
 func main() {
+	retainGatewayReleaseStamp()
 	if handled, err := handleInternalPlatformCommand(os.Args[1:]); handled {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "FAIL: %v\n", err)
@@ -26,7 +27,7 @@ func main() {
 		var filename string
 		filename, err = artifactPlatformFilename(runtime.GOOS, runtime.GOARCH)
 		if err == nil {
-			fmt.Printf("BuildVersion=%d Target=%s\n", BuildVersion, filename)
+			fmt.Printf("BuildVersion=%s Target=%s\n", BuildVersion, filename)
 		}
 	default:
 		err = errors.New("usage: camos-gateway commission <commission_id> | service | version")

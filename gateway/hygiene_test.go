@@ -59,3 +59,53 @@ func TestEveryNativeServiceClearsStaleFramePackagesBeforeRuntimeStartup(t *testi
 		}
 	}
 }
+
+func TestEveryNativeServiceRecoversUpdatesBeforeOptionalRuntimeStartup(t *testing.T) {
+	for _, name := range []string{
+		"service_windows.go",
+		"service_linux.go",
+		"service_darwin.go",
+	} {
+		encoded, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		source := string(encoded)
+		removal := strings.Index(source, "posixRemovalPending()")
+		if name == "service_windows.go" {
+			removal = strings.Index(source, "windowsRemovalAuthorized()")
+		}
+		recovery := strings.Index(source, "reconcileUpdateStateAtStartup(")
+		ffmpeg := strings.Index(source, "installedFFmpegPath()")
+		credentials := strings.Index(source, "newRuntimeCredentials(")
+		if removal < 0 || recovery < 0 || ffmpeg < 0 || credentials < 0 ||
+			removal > recovery || recovery > ffmpeg || recovery > credentials {
+			t.Fatalf("%s does not recover updates after removal authority and before optional runtime startup", name)
+		}
+	}
+}
+
+func TestEveryNativeServiceRecoversCandidateAfterPreControllerFailure(t *testing.T) {
+	for _, name := range []string{
+		"service_windows.go",
+		"service_linux.go",
+		"service_darwin.go",
+	} {
+		encoded, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		source := string(encoded)
+		reconcile := strings.Index(source, "reconcileUpdateStateAtStartup(")
+		recoveryName := "recoverPOSIXCandidateStartupFailure("
+		if name == "service_windows.go" {
+			recoveryName = "recoverCandidateAfterStartupFailure("
+		}
+		recovery := strings.Index(source, recoveryName)
+		controller := strings.Index(source, "runController(")
+		if reconcile < 0 || recovery < 0 || controller < 0 ||
+			reconcile > recovery || recovery > controller {
+			t.Fatalf("%s does not recover an admitted candidate after pre-controller startup failure", name)
+		}
+	}
+}

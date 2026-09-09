@@ -45,10 +45,12 @@ func (err *commissionHTTPError) Error() string {
 }
 
 type preparedCommission struct {
-	paths      identityPaths
-	hash       commissionHash
-	privateKey *rsa.PrivateKey
-	committed  bool
+	paths               identityPaths
+	hash                commissionHash
+	privateKey          *rsa.PrivateKey
+	directoryGeneration os.FileInfo
+	gatewayID           uuid.UUID
+	committed           bool
 }
 
 func commission(rawCommissionID string) error {
@@ -89,10 +91,17 @@ func commission(rawCommissionID string) error {
 			string(publicKeyPEM),
 			retryDelay,
 		)
+		if removalErr := ensureCommissioningAllowed(prepared.paths); removalErr != nil {
+			return removalErr
+		}
 		if err != nil {
 			var httpError *commissionHTTPError
 			if errors.As(err, &httpError) && httpError.definitiveInvalidID {
-				_ = removeUncommittedIdentity(prepared.paths)
+				// Only erase the attempt that made this rejected request. A
+				// concurrent terminal removal or replacement commission may have
+				// changed the canonical identity generation while the network call
+				// was in flight.
+				_ = cleanupRejectedCommission(prepared)
 			}
 			return err
 		}
@@ -109,26 +118,13 @@ func commission(rawCommissionID string) error {
 		); err != nil {
 			return fmt.Errorf("Commission Service returned invalid identity: %w", err)
 		}
-		if err := saveGatewayCertificate(prepared.paths, certificatePEM); err != nil {
-			return errors.New("Gateway certificate persistence failed")
-		}
-		if err := ensureCertificateConfig(prepared.paths); err != nil {
-			return err
-		}
-		// Prove the issued identity through X.509 WIF before making GatewayID
-		// the final commit marker. A bad or unusable certificate therefore
-		// remains a resumable commissioning attempt instead of permanently
-		// committing an appliance that cannot authenticate.
-		if err := proveRuntimeIdentity(ctx, gatewayID, prepared.paths.certificateConfig); err != nil {
-			return err
-		}
-		// GatewayID is deliberately the final durable identity commit marker.
-		if err := saveGatewayID(gatewayID); err != nil {
+		prepared.gatewayID = gatewayID
+		if err := commitPreparedCommissionIdentity(ctx, prepared, certificatePEM); err != nil {
 			return err
 		}
 	}
 
-	if err := installService(); err != nil {
+	if err := installService(prepared, time.Now()); err != nil {
 		return err
 	}
 	if err := waitForCommissionCompletion(
@@ -137,6 +133,9 @@ func commission(rawCommissionID string) error {
 		prepared.hash,
 		commissionCompletionPoll,
 	); err != nil {
+		return err
+	}
+	if err := validatePreparedCommissionCompletion(prepared, time.Now()); err != nil {
 		return err
 	}
 	fmt.Fprintln(os.Stdout, "COMMISSIONING COMPLETE")
@@ -148,7 +147,18 @@ func prepareCommission(rawCommissionID string, now time.Time) (preparedCommissio
 	if err != nil {
 		return preparedCommission{}, err
 	}
-	if err := prepareIdentityDirectory(paths); err != nil {
+	if err := ensureCommissioningAllowed(paths); err != nil {
+		return preparedCommission{}, err
+	}
+	release, err := acquireGatewayLifecycleLock(lifecycleOperationLockWait)
+	if err != nil {
+		return preparedCommission{}, err
+	}
+	defer release()
+	if err := ensureCommissioningAllowed(paths); err != nil {
+		return preparedCommission{}, err
+	}
+	if err := createIdentityDirectory(paths); err != nil {
 		return preparedCommission{}, err
 	}
 	expectedHash := hashCommissionID(rawCommissionID)
@@ -172,12 +182,18 @@ func prepareCommission(rawCommissionID string, now time.Time) (preparedCommissio
 		if !pending.matches(expectedHash) {
 			return preparedCommission{}, errors.New("a different commissioning attempt is incomplete")
 		}
-		return preparedCommission{
+		if err := ensureCommissioningAllowed(paths); err != nil {
+			return preparedCommission{}, err
+		}
+		prepared := preparedCommission{
 			paths:      paths,
 			hash:       expectedHash,
 			privateKey: identity.privateKey,
+			gatewayID:  identity.gatewayID,
 			committed:  true,
-		}, nil
+		}
+		prepared.directoryGeneration, err = captureIdentityDirectoryGeneration(paths)
+		return prepared, err
 	}
 
 	if pendingErr != nil {
@@ -227,11 +243,165 @@ func prepareCommission(rawCommissionID string, now time.Time) (preparedCommissio
 			}
 		}
 	}
-	return preparedCommission{
+	if err := ensureCommissioningAllowed(paths); err != nil {
+		return preparedCommission{}, err
+	}
+	prepared := preparedCommission{
 		paths:      paths,
 		hash:       expectedHash,
 		privateKey: privateKey,
-	}, nil
+	}
+	prepared.directoryGeneration, err = captureIdentityDirectoryGeneration(paths)
+	return prepared, err
+}
+
+// validatePreparedCommissionFiles proves that a network response still
+// belongs to the exact local attempt and directory generation that created its
+// public key. It intentionally performs no cleanup on mismatch.
+func validatePreparedCommissionFiles(prepared preparedCommission) error {
+	if prepared.directoryGeneration == nil || prepared.privateKey == nil {
+		return errors.New("prepared Gateway identity is invalid")
+	}
+	currentGeneration, err := captureIdentityDirectoryGeneration(prepared.paths)
+	if err != nil || !os.SameFile(prepared.directoryGeneration, currentGeneration) {
+		return errors.New("Gateway identity generation changed during commissioning")
+	}
+	pending, err := loadPendingCommissionHash(prepared.paths)
+	if err != nil || pending == nil || !pending.matches(prepared.hash) {
+		return errors.New("pending commissioning state changed unexpectedly")
+	}
+	privateKey, err := readGatewayPrivateKey(prepared.paths.privateKey)
+	if err != nil || !publicKeysEqual(&privateKey.PublicKey, &prepared.privateKey.PublicKey) {
+		return errors.New("Gateway private key changed during commissioning")
+	}
+	return nil
+}
+
+func commitPreparedCommissionIdentity(
+	ctx context.Context,
+	prepared preparedCommission,
+	certificatePEM []byte,
+) error {
+	release, err := acquireGatewayLifecycleLock(lifecycleOperationLockWait)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := ensureCommissioningAllowed(prepared.paths); err != nil {
+		return err
+	}
+	if err := validatePreparedCommissionFiles(prepared); err != nil {
+		return err
+	}
+	committed, err := gatewayIDCommitPresent()
+	if err != nil {
+		return errors.New("GatewayID inspection failed")
+	}
+	if committed {
+		return errors.New("Gateway identity changed during commissioning")
+	}
+	if err := saveGatewayCertificate(prepared.paths, certificatePEM); err != nil {
+		return errors.New("Gateway certificate persistence failed")
+	}
+	if err := ensureCertificateConfig(prepared.paths); err != nil {
+		return err
+	}
+	// Prove the issued identity through X.509 WIF before making GatewayID the
+	// final commit marker. Holding the short lifecycle boundary across proof
+	// prevents removal or another commissioning process from replacing the
+	// directory between proof and publication.
+	if err := proveRuntimeIdentity(ctx, prepared.gatewayID, prepared.paths.certificateConfig); err != nil {
+		return err
+	}
+	if err := ensureCommissioningAllowed(prepared.paths); err != nil {
+		return err
+	}
+	if err := validatePreparedCommissionFiles(prepared); err != nil {
+		return err
+	}
+	if committed, err := gatewayIDCommitPresent(); err != nil || committed {
+		return errors.New("Gateway identity changed during commissioning")
+	}
+	// GatewayID is deliberately the final durable identity commit marker.
+	return saveGatewayID(prepared.gatewayID)
+}
+
+// validatePreparedCommissionServiceInstall runs while the platform installer
+// owns the lifecycle lock. This closes the gap between the final commissioning
+// check and native service/package publication without nesting platform locks.
+func validatePreparedCommissionServiceInstall(prepared preparedCommission, now time.Time) error {
+	currentGeneration, err := captureIdentityDirectoryGeneration(prepared.paths)
+	if err != nil || prepared.directoryGeneration == nil ||
+		!os.SameFile(prepared.directoryGeneration, currentGeneration) {
+		return errors.New("Gateway identity generation changed during commissioning")
+	}
+	identity, err := loadGatewayIdentity(now)
+	if err != nil || identity.gatewayID != prepared.gatewayID ||
+		!publicKeysEqual(&identity.privateKey.PublicKey, &prepared.privateKey.PublicKey) {
+		return errors.New("Gateway identity changed during commissioning")
+	}
+	if pending, pendingErr := loadPendingCommissionHash(prepared.paths); pendingErr != nil {
+		return pendingErr
+	} else if pending != nil && !pending.matches(prepared.hash) {
+		return errors.New("pending commissioning state changed unexpectedly")
+	}
+	return nil
+}
+
+func validatePreparedCommissionCompletion(prepared preparedCommission, now time.Time) error {
+	release, err := acquireGatewayLifecycleLock(lifecycleOperationLockWait)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := ensureCommissioningAllowed(prepared.paths); err != nil {
+		return err
+	}
+	if err := validatePreparedCommissionServiceInstall(prepared, now); err != nil {
+		return err
+	}
+	pending, err := loadPendingCommissionHash(prepared.paths)
+	if err != nil || pending != nil {
+		return errors.New("pending commissioning completion changed unexpectedly")
+	}
+	return nil
+}
+
+func cleanupRejectedCommission(prepared preparedCommission) error {
+	release, err := acquireGatewayLifecycleLock(lifecycleOperationLockWait)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := ensureCommissioningAllowed(prepared.paths); err != nil {
+		return err
+	}
+	if err := validatePreparedCommissionFiles(prepared); err != nil {
+		return err
+	}
+	committed, err := gatewayIDCommitPresent()
+	if err != nil || committed {
+		return errors.New("Gateway identity changed during commissioning")
+	}
+	return removeUncommittedIdentity(prepared.paths)
+}
+
+func ensureCommissioningAllowed(paths identityPaths) error {
+	nativePending, nativeErr := platformRemovalStatePresent()
+	if nativeErr != nil {
+		return nativeErr
+	}
+	if nativePending {
+		return errors.New("Gateway terminal removal is pending")
+	}
+	_, err := os.Lstat(paths.removalPending)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return errors.New("terminal removal state is unavailable")
+	}
+	return errors.New("Gateway terminal removal is pending")
 }
 
 func removeUncommittedCredentialFiles(paths identityPaths) error {
@@ -365,6 +535,9 @@ func waitForCommissionCompletion(
 	pollInterval time.Duration,
 ) error {
 	for {
+		if err := ensureCommissioningAllowed(paths); err != nil {
+			return err
+		}
 		encoded, err := os.ReadFile(paths.commissionHash)
 		if errors.Is(err, os.ErrNotExist) {
 			return nil

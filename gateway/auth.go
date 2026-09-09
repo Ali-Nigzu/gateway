@@ -52,6 +52,7 @@ var (
 
 type runtimeCredentials struct {
 	gatewayID                uuid.UUID
+	identityGeneration       os.FileInfo
 	cloudPlatformTokenSource oauth2.TokenSource
 	databaseLoginTokenSource oauth2.TokenSource
 	renewalTokenSource       oauth2.TokenSource
@@ -101,23 +102,81 @@ func validateBootstrapCredentials(encoded []byte) error {
 }
 
 func newRuntimeCredentials(ctx context.Context) (*runtimeCredentials, error) {
+	release, err := acquireGatewayLifecycleLock(lifecycleOperationLockWait)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	paths, err := resolveIdentityPaths()
+	if err != nil {
+		return nil, err
+	}
+	if err := ensureCommissioningAllowed(paths); err != nil {
+		return nil, err
+	}
 	identity, err := loadGatewayIdentity(time.Now())
 	if err != nil {
 		return nil, err
 	}
-	paths, err := resolveIdentityPaths()
+	generation, err := captureIdentityDirectoryGeneration(paths)
 	if err != nil {
 		return nil, err
 	}
 	if err := ensureCertificateConfig(paths); err != nil {
 		return nil, err
 	}
-	return newRuntimeCredentialsFromConfig(
+	credentials, err := newRuntimeCredentialsFromConfig(
 		ctx,
 		identity.gatewayID,
 		paths.certificateConfig,
 		&http.Client{Timeout: authHTTPTimeout},
 	)
+	if err != nil {
+		return nil, err
+	}
+	currentGeneration, err := captureIdentityDirectoryGeneration(paths)
+	if err != nil || !os.SameFile(generation, currentGeneration) {
+		return nil, errors.New("runtime identity generation changed unexpectedly")
+	}
+	credentials.identityGeneration = generation
+	return credentials, nil
+}
+
+func validateRuntimeIdentityGeneration(credentials *runtimeCredentials) error {
+	if credentials == nil || credentials.gatewayID == uuid.Nil ||
+		credentials.identityGeneration == nil {
+		return errors.New("runtime identity generation is unavailable")
+	}
+	paths, err := resolveIdentityPaths()
+	if err != nil {
+		return err
+	}
+	return validateBoundIdentityGeneration(
+		credentials.identityGeneration,
+		credentials.gatewayID,
+		paths,
+		loadGatewayID,
+	)
+}
+
+func validateBoundIdentityGeneration(
+	expectedGeneration os.FileInfo,
+	expectedGatewayID uuid.UUID,
+	paths identityPaths,
+	readGatewayID func() (uuid.UUID, error),
+) error {
+	if expectedGeneration == nil || expectedGatewayID == uuid.Nil || readGatewayID == nil {
+		return errors.New("runtime identity generation is unavailable")
+	}
+	currentGeneration, err := captureIdentityDirectoryGeneration(paths)
+	if err != nil || !os.SameFile(expectedGeneration, currentGeneration) {
+		return errors.New("runtime identity generation changed unexpectedly")
+	}
+	gatewayID, err := readGatewayID()
+	if err != nil || gatewayID != expectedGatewayID {
+		return errors.New("runtime GatewayID changed unexpectedly")
+	}
+	return nil
 }
 
 func newRuntimeCredentialsFromConfig(
@@ -277,6 +336,14 @@ func renewGatewayCertificate(
 	if err != nil {
 		return false, err
 	}
+	paths, err := resolveIdentityPaths()
+	if err != nil {
+		return false, err
+	}
+	directoryGeneration, err := captureIdentityDirectoryGeneration(paths)
+	if err != nil {
+		return false, err
+	}
 	if identity.gatewayID != credentials.gatewayID {
 		return false, errors.New("runtime renewal identity changed unexpectedly")
 	}
@@ -311,10 +378,25 @@ func renewGatewayCertificate(
 	); err != nil {
 		return false, errors.New("renewal service returned an invalid certificate")
 	}
-	paths, err := resolveIdentityPaths()
+	release, err := acquireGatewayLifecycleLock(lifecycleOperationLockWait)
 	if err != nil {
 		return false, err
 	}
+	defer release()
+	if err := ensureCommissioningAllowed(paths); err != nil {
+		return false, err
+	}
+	currentGeneration, err := captureIdentityDirectoryGeneration(paths)
+	if err != nil || !os.SameFile(directoryGeneration, currentGeneration) {
+		return false, errors.New("runtime renewal identity generation changed unexpectedly")
+	}
+	currentIdentity, err := loadGatewayIdentity(time.Now().UTC())
+	if err != nil || !sameGatewayIdentity(identity, currentIdentity) {
+		return false, errors.New("runtime renewal identity changed unexpectedly")
+	}
+	// The proof uses fixed, protected staging names. Keep the lifecycle lock
+	// through proof and publication so terminal removal, commissioning, and a
+	// competing renewal cannot redirect those writes into another generation.
 	if err := proveRenewedCertificate(ctx, paths, candidatePEM); err != nil {
 		return false, err
 	}
@@ -322,6 +404,13 @@ func renewGatewayCertificate(
 		return false, errors.New("renewed Gateway certificate persistence failed")
 	}
 	return true, nil
+}
+
+func sameGatewayIdentity(first, second gatewayIdentity) bool {
+	return first.gatewayID != uuid.Nil && first.gatewayID == second.gatewayID &&
+		first.privateKey != nil && second.privateKey != nil &&
+		publicKeysEqual(&first.privateKey.PublicKey, &second.privateKey.PublicKey) &&
+		bytes.Equal(first.certificatePEM, second.certificatePEM)
 }
 
 func requestCertificateRenewal(

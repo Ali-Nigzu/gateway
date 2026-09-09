@@ -239,7 +239,7 @@ func nullableString(value sql.NullString) string {
 func (store *postgresStore) refreshGatewayControl(
 	ctx context.Context,
 	gatewayID uuid.UUID,
-	reportedVersion int16,
+	reportedVersion string,
 ) (gatewayControl, error) {
 	var control gatewayControl
 	err := store.database.QueryRowContext(

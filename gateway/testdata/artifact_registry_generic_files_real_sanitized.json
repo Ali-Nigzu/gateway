@@ -1,0 +1,21 @@
+{
+  "files": [
+    {
+      "name": "projects/camosbase/locations/europe-west2/repositories/camos-gateway-prod/files/gateway:2:windows-amd64.exe",
+      "sizeBytes": "157286400",
+      "hashes": [
+        {
+          "type": "MD5",
+          "value": "EREREREREREREREREREREQ=="
+        },
+        {
+          "type": "SHA256",
+          "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        }
+      ],
+      "owner": "projects/camosbase/locations/europe-west2/repositories/camos-gateway-prod/packages/gateway/versions/2",
+      "createTime": "2026-01-01T00:00:00Z",
+      "updateTime": "2026-01-01T00:00:00Z"
+    }
+  ]
+}

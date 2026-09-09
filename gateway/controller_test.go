@@ -4,8 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 func TestControlPriorityTruthTable(t *testing.T) {
@@ -16,7 +19,7 @@ func TestControlPriorityTruthTable(t *testing.T) {
 		expected controlPriority
 	}{
 		{"state zero null removes", gatewayControl{desiredState: 0}, controlPriorityRemove},
-		{"terminal outranks update", gatewayControl{desiredState: 0, desiredVersion: 3}, controlPriorityRemove},
+		{"terminal outranks update", gatewayControl{desiredState: 0, desiredVersion: "1.1"}, controlPriorityRemove},
 		{"state zero assigned parks", gatewayControl{desiredState: 0, siteID: validInt64(7)}, controlPriorityPark},
 		{"state one assigned parks", gatewayControl{desiredState: 1, siteID: validInt64(7)}, controlPriorityPark},
 		{"state one null parks", gatewayControl{desiredState: 1}, controlPriorityPark},
@@ -25,9 +28,9 @@ func TestControlPriorityTruthTable(t *testing.T) {
 		{"disabled organisation parks", disabledOrganisationControl(), controlPriorityPark},
 		{"disabled site parks", disabledSiteControl(), controlPriorityPark},
 		{"active hierarchy runs", active, controlPriorityRun},
-		{"upgrade mismatch updates", withDesiredVersion(active, 3), controlPriorityUpdate},
-		{"version two stays", withDesiredVersion(active, BuildVersion), controlPriorityRun},
-		{"version one downgrades", withDesiredVersion(active, 1), controlPriorityUpdate},
+		{"upgrade mismatch updates", withDesiredVersion(active, "1.1"), controlPriorityUpdate},
+		{"version 1.0 stays", withDesiredVersion(active, BuildVersion), controlPriorityRun},
+		{"older release downgrades", withDesiredVersion(active, "0.9"), controlPriorityUpdate},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -39,20 +42,196 @@ func TestControlPriorityTruthTable(t *testing.T) {
 }
 
 func TestCandidateTargetRequiresUnchangedNonTerminalControl(t *testing.T) {
-	active := withDesiredVersion(activeTestControl(), 3)
-	if !candidateTargetStillCurrent(3, active) {
+	active := withDesiredVersion(activeTestControl(), "1.1")
+	if !candidateTargetStillCurrent("1.1", active) {
 		t.Fatal("unchanged target was rejected")
 	}
-	changed := withDesiredVersion(active, 4)
-	if candidateTargetStillCurrent(3, changed) {
+	changed := withDesiredVersion(active, "1.2")
+	if candidateTargetStillCurrent("1.1", changed) {
 		t.Fatal("stale target was accepted")
 	}
-	terminal := gatewayControl{desiredState: 0, desiredVersion: 3}
-	if candidateTargetStillCurrent(3, terminal) {
+	terminal := gatewayControl{desiredState: 0, desiredVersion: "1.1"}
+	if candidateTargetStillCurrent("1.1", terminal) {
 		t.Fatal("terminal removal did not outrank update")
 	}
 	if candidateTargetStillCurrent(BuildVersion, activeTestControl()) {
 		t.Fatal("current build was accepted as an update target")
+	}
+}
+
+func TestCandidateAttemptRejectsEveryLifecycleFingerprintChange(t *testing.T) {
+	original := withDesiredVersion(activeTestControl(), "1.1")
+	if !candidateAttemptStillCurrent(original, original) {
+		t.Fatal("unchanged lifecycle fingerprint was rejected")
+	}
+	changes := map[string]func(gatewayControl) gatewayControl{
+		"desired version": func(control gatewayControl) gatewayControl {
+			control.desiredVersion = "1.2"
+			return control
+		},
+		"desired state": func(control gatewayControl) gatewayControl {
+			control.desiredState = 1
+			return control
+		},
+		"site": func(control gatewayControl) gatewayControl {
+			control.siteID = validInt64(8)
+			return control
+		},
+		"organisation": func(control gatewayControl) gatewayControl {
+			control.organisationID = validInt64(10)
+			return control
+		},
+		"organisation enabled": func(control gatewayControl) gatewayControl {
+			control.organisationEnabled.Bool = false
+			return control
+		},
+		"site enabled": func(control gatewayControl) gatewayControl {
+			control.siteEnabled.Bool = false
+			return control
+		},
+		"restart request": func(control gatewayControl) gatewayControl {
+			control.restartRequestedAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
+			return control
+		},
+	}
+	for name, change := range changes {
+		t.Run(name, func(t *testing.T) {
+			if candidateAttemptStillCurrent(original, change(original)) {
+				t.Fatal("changed lifecycle fingerprint was accepted")
+			}
+		})
+	}
+}
+
+func TestTerminalRemovalRequiresStopThenSecondMatchingFreshRead(t *testing.T) {
+	first := gatewayControl{desiredState: 0, desiredVersion: BuildVersion}
+	events := []string{}
+	committed, err := commitTerminalRemoval(
+		context.Background(),
+		first,
+		func() bool {
+			events = append(events, "stop")
+			return true
+		},
+		func(context.Context) (gatewayControl, error) {
+			events = append(events, "read-b")
+			return first, nil
+		},
+		func() error {
+			events = append(events, "marker")
+			return nil
+		},
+	)
+	if err != nil || !committed {
+		t.Fatalf("terminal removal was not committed: committed=%v err=%v", committed, err)
+	}
+	if expected := []string{"stop", "read-b", "marker"}; !reflect.DeepEqual(events, expected) {
+		t.Fatalf("events = %v, want %v", events, expected)
+	}
+}
+
+func TestTerminalRemovalNeverCommitsAfterPreCommitFailure(t *testing.T) {
+	first := gatewayControl{desiredState: 0, desiredVersion: BuildVersion}
+	tests := []struct {
+		name    string
+		stop    bool
+		second  gatewayControl
+		readErr error
+	}{
+		{name: "camera stop timed out", stop: false, second: first},
+		{name: "second read failed", stop: true, second: first, readErr: errors.New("db unavailable")},
+		{name: "site assigned", stop: true, second: gatewayControl{desiredState: 0, desiredVersion: BuildVersion, siteID: validInt64(7)}},
+		{name: "state changed", stop: true, second: gatewayControl{desiredState: 1, desiredVersion: BuildVersion}},
+		{name: "version changed", stop: true, second: gatewayControl{desiredState: 0, desiredVersion: "1.1"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			markerWrites := 0
+			committed, err := commitTerminalRemoval(
+				context.Background(), first,
+				func() bool { return test.stop },
+				func(context.Context) (gatewayControl, error) { return test.second, test.readErr },
+				func() error { markerWrites++; return nil },
+			)
+			if err == nil || committed || markerWrites != 0 {
+				t.Fatalf("committed=%v writes=%d err=%v", committed, markerWrites, err)
+			}
+		})
+	}
+}
+
+func TestTerminalRemovalMarkerPublicationFailureNeverCommits(t *testing.T) {
+	first := gatewayControl{desiredState: 0, desiredVersion: BuildVersion}
+	markerWrites := 0
+	committed, err := commitTerminalRemoval(
+		context.Background(),
+		first,
+		func() bool { return true },
+		func(context.Context) (gatewayControl, error) { return first, nil },
+		func() error {
+			markerWrites++
+			return errors.New("marker storage unavailable")
+		},
+	)
+	if err == nil || committed || markerWrites != 1 {
+		t.Fatalf("committed=%v writes=%d err=%v", committed, markerWrites, err)
+	}
+}
+
+func TestCommittedRemovalRetriesOnlyLocalContinuation(t *testing.T) {
+	stops := 0
+	starts := 0
+	failures := 0
+	stop := func() bool { stops++; return true }
+	begin := func() error {
+		starts++
+		if starts == 1 {
+			return errors.New("helper unavailable")
+		}
+		return nil
+	}
+	record := func(error) { failures++ }
+	if continueCommittedRemovalWith(stop, begin, record) {
+		t.Fatal("failed helper unexpectedly completed handoff")
+	}
+	if !continueCommittedRemovalWith(stop, begin, record) {
+		t.Fatal("committed removal did not retry local helper preparation")
+	}
+	if stops != 2 || starts != 2 || failures != 1 {
+		t.Fatalf("stops=%d starts=%d failures=%d", stops, starts, failures)
+	}
+}
+
+func TestStopEngineWithinIsBounded(t *testing.T) {
+	canceled := false
+	engine := &activeEngine{
+		cancel: func() { canceled = true },
+		done:   make(chan error),
+	}
+	started := time.Now()
+	if stopEngineWithin(&engine, 5*time.Millisecond) {
+		t.Fatal("stuck engine was reported stopped")
+	}
+	if !canceled || engine == nil {
+		t.Fatal("stuck engine was not canceled and retained for later drain")
+	}
+	if time.Since(started) > time.Second {
+		t.Fatal("bounded engine stop exceeded its test bound")
+	}
+}
+
+func TestUpdateRetryBackoffIsBoundedAndGatewaySpecific(t *testing.T) {
+	firstID := uuid.UUID{1}
+	secondID := uuid.UUID{2}
+	first := updateRetryDelay(firstID, "1.1", 1)
+	if first < retryDelay || first > time.Hour {
+		t.Fatalf("first retry delay = %v", first)
+	}
+	if capped := updateRetryDelay(firstID, "1.1", 100); capped > time.Hour {
+		t.Fatalf("capped retry delay = %v", capped)
+	}
+	if first == updateRetryDelay(secondID, "1.1", 1) {
+		t.Fatal("Gateway-specific jitter was not applied")
 	}
 }
 
@@ -304,7 +483,7 @@ func disabledSiteControl() gatewayControl {
 	return control
 }
 
-func withDesiredVersion(control gatewayControl, version int16) gatewayControl {
+func withDesiredVersion(control gatewayControl, version string) gatewayControl {
 	control.desiredVersion = version
 	return control
 }

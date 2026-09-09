@@ -38,12 +38,39 @@ type windowsPackagePaths struct {
 	ffmpeg     string
 }
 
-func installService() error {
+func installService(prepared preparedCommission, now time.Time) error {
+	releaseLifecycle, err := acquireGatewayLifecycleLock(lifecycleOperationLockWait)
+	if err != nil {
+		return err
+	}
+	lockHeld := true
+	defer func() {
+		if lockHeld {
+			releaseLifecycle()
+		}
+	}()
+	identityPaths, err := resolveIdentityPaths()
+	if err != nil {
+		return err
+	}
+	if err := ensureCommissioningAllowed(identityPaths); err != nil {
+		return err
+	}
+	if err := validatePreparedCommissionServiceInstall(prepared, now); err != nil {
+		return err
+	}
 	if err := validateEmbeddedRelease(); err != nil {
 		return err
 	}
 	paths, err := resolveWindowsPackagePaths()
 	if err != nil {
+		return err
+	}
+	// Repair package bytes even when an interrupted terminal removal left the
+	// named SCM service behind. The new commissioning identity is committed
+	// before this call, and the commissioning guard proves no old marker/helper
+	// tombstone remains before any canonical pathname can be reused.
+	if err := installWindowsPackageIfAbsent(paths); err != nil {
 		return err
 	}
 	manager, err := mgr.Connect()
@@ -54,48 +81,57 @@ func installService() error {
 
 	service, err := manager.OpenService(windowsServiceName)
 	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-		return installFirstWindowsService(manager, paths)
+		service, err = createFirstWindowsService(manager, paths)
 	}
 	if err != nil {
 		return fmt.Errorf("Gateway service inspection failed: %w", err)
 	}
 	defer service.Close()
 
-	currentConfig, err := service.Config()
-	if err != nil {
-		return fmt.Errorf("Gateway service configuration read failed: %w", err)
-	}
-	expectedConfig := windowsServiceConfig(paths.executable)
-
-	if serviceRuntimeConfigurationChanged(currentConfig, expectedConfig) {
-		if err := stopWindowsService(service); err != nil {
-			return err
+	if service != nil {
+		currentConfig, err := service.Config()
+		if err != nil {
+			return fmt.Errorf("Gateway service configuration read failed: %w", err)
 		}
-	}
+		expectedConfig := windowsServiceConfig(paths.executable)
 
-	if !windowsServiceConfigurationMatches(currentConfig, expectedConfig) {
-		if err := service.UpdateConfig(expectedConfig); err != nil {
-			return fmt.Errorf("Gateway service configuration failed: %w", err)
-		}
-		if len(currentConfig.Dependencies) != 0 {
-			if err := clearWindowsServiceDependencies(service); err != nil {
+		if serviceRuntimeConfigurationChanged(currentConfig, expectedConfig) {
+			if err := stopWindowsService(service); err != nil {
 				return err
 			}
 		}
+
+		if !windowsServiceConfigurationMatches(currentConfig, expectedConfig) {
+			if err := service.UpdateConfig(expectedConfig); err != nil {
+				return fmt.Errorf("Gateway service configuration failed: %w", err)
+			}
+			if len(currentConfig.Dependencies) != 0 {
+				if err := clearWindowsServiceDependencies(service); err != nil {
+					return err
+				}
+			}
+		}
+		if err := configureWindowsServiceRecovery(service); err != nil {
+			return err
+		}
 	}
-	if err := configureWindowsServiceRecovery(service); err != nil {
+	if err := ensureCommissioningAllowed(identityPaths); err != nil {
 		return err
 	}
-	return ensureWindowsServiceRunning(service)
+	if err := requestWindowsServiceStart(service); err != nil {
+		return err
+	}
+	// Release once SCM has accepted the start/continue request. The service can
+	// then take the same lock for startup recovery while this caller only waits.
+	releaseLifecycle()
+	lockHeld = false
+	return waitForWindowsServiceRunningAfterRequest(service)
 }
 
-func installFirstWindowsService(
+func createFirstWindowsService(
 	manager *mgr.Mgr,
 	paths windowsPackagePaths,
-) error {
-	if err := installWindowsPackageIfAbsent(paths); err != nil {
-		return err
-	}
+) (*mgr.Service, error) {
 	config := windowsServiceConfig(paths.executable)
 	service, err := manager.CreateService(
 		windowsServiceName,
@@ -104,14 +140,10 @@ func installFirstWindowsService(
 		"service",
 	)
 	if err != nil {
-		return fmt.Errorf("Gateway service installation failed: %w", err)
+		return nil, fmt.Errorf("Gateway service installation failed: %w", err)
 	}
-	defer service.Close()
 
-	if err := configureWindowsServiceRecovery(service); err != nil {
-		return err
-	}
-	return ensureWindowsServiceRunning(service)
+	return service, nil
 }
 
 func resolveWindowsPackagePaths() (windowsPackagePaths, error) {
@@ -337,6 +369,53 @@ func stopWindowsService(service *mgr.Service) error {
 			default:
 				return fmt.Errorf("Gateway service stop failed: %w", err)
 			}
+		}
+		time.Sleep(serviceStatePollInterval)
+	}
+}
+
+func requestWindowsServiceStart(service *mgr.Service) error {
+	if service == nil {
+		return errors.New("Gateway service is unavailable")
+	}
+	status, err := service.Query()
+	if err != nil {
+		return fmt.Errorf("Gateway service state query failed: %w", err)
+	}
+	switch status.State {
+	case svc.Running, svc.StartPending, svc.ContinuePending:
+		return nil
+	case svc.Stopped:
+		if err := service.Start(); err != nil &&
+			!errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
+			return fmt.Errorf("Gateway service start failed: %w", err)
+		}
+		return nil
+	case svc.Paused:
+		if _, err := service.Control(svc.Continue); err != nil {
+			return fmt.Errorf("Gateway service continue failed: %w", err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("Gateway service cannot start from state %d", status.State)
+	}
+}
+
+func waitForWindowsServiceRunningAfterRequest(service *mgr.Service) error {
+	deadline := time.Now().Add(serviceTransitionTimeout)
+	for {
+		status, err := service.Query()
+		if err != nil {
+			return fmt.Errorf("Gateway service state query failed: %w", err)
+		}
+		if status.State == svc.Running {
+			return nil
+		}
+		if status.State == svc.Stopped {
+			return errors.New("Gateway service did not remain running")
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("Gateway service start timed out in state %d", status.State)
 		}
 		time.Sleep(serviceStatePollInterval)
 	}
