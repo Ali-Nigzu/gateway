@@ -4,7 +4,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$expectedBuildVersion = "1.0"
+$expectedBuildVersion = "1.1"
 $gatewayRoot = $PSScriptRoot
 $outputDirectory = Join-Path $gatewayRoot "dist"
 $bootstrapPath = Join-Path $gatewayRoot "bootstrap_sa.json"
@@ -119,4 +119,4 @@ try {
     Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $temporaryChecksumPath
 }
 
-Write-Output "Built and statically verified dist/windows-amd64.exe (BuildVersion 1.0)"
+Write-Output "Built and statically verified dist/windows-amd64.exe (BuildVersion 1.1)"
